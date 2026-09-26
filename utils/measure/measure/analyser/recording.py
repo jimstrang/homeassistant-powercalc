@@ -10,6 +10,7 @@ from measure.recording.models import (
     RecordedEntityState,
     RecordingContext,
     RecordingDataset,
+    RecordingMetadata,
     RecordingSample,
 )
 
@@ -20,7 +21,7 @@ def load_recording(path: Path, *, recording_id: int = 0) -> LoadedRecording:
     samples: list[RecordingSample] = []
     invalid_count = 0
     first_invalid: str | None = None
-    metadata: dict[str, object] | None = None
+    metadata: RecordingMetadata | None = None
     with path.open(encoding="utf-8") as recording:
         for line_number, line in enumerate(recording, start=1):
             try:
@@ -28,7 +29,7 @@ def load_recording(path: Path, *, recording_id: int = 0) -> LoadedRecording:
                 if not isinstance(record, dict):
                     raise ValueError("record is not an object")
                 if record.get("record_type") == "metadata":
-                    metadata = record
+                    metadata = _parse_metadata(record)
                     continue
                 if record.get("record_type") not in (None, "sample"):
                     continue
@@ -60,7 +61,8 @@ def load_recordings(paths: Sequence[Path]) -> LoadedRecording:
             metadata is not None
             and other is not None
             and (
-                any(metadata.get(key) != other.get(key) for key in ("recipe", "primary_entity_id"))
+                metadata.recipe != other.recipe
+                or metadata.primary_entity_id != other.primary_entity_id
                 or selected_entities != _normalize_selected_entity_metadata(other)
             )
         ):
@@ -70,15 +72,12 @@ def load_recordings(paths: Sequence[Path]) -> LoadedRecording:
     return LoadedRecording(RecordingDataset(samples, metadata), warnings)
 
 
-def _normalize_selected_entity_metadata(metadata: Mapping[str, object]) -> list[RecordedEntity]:
+def _normalize_selected_entity_metadata(metadata: RecordingMetadata) -> list[RecordedEntity]:
     """Compare entity identities and signal metadata independently of live availability."""
-    return [
-        replace(entity, has_live_state=None, disabled_by=None)
-        for entity in _parse_metadata_entities(metadata.get("entities"))
-    ]
+    return [replace(entity, has_live_state=None, disabled_by=None) for entity in metadata.entities]
 
 
-def restore_recording_context(fallback: RecordingContext, metadata: Mapping[str, object] | None) -> RecordingContext:
+def restore_recording_context(fallback: RecordingContext, metadata: RecordingMetadata | None) -> RecordingContext:
     """Reanalyse using captured registry metadata, without contacting Home Assistant.
 
     Requests still choose the recipe, primary entity, and roles. A metadata header
@@ -86,11 +85,11 @@ def restore_recording_context(fallback: RecordingContext, metadata: Mapping[str,
     """
     if (
         metadata is None
-        or metadata.get("recipe") != fallback.recipe
-        or metadata.get("primary_entity_id") != fallback.primary_entity_id
+        or metadata.recipe != fallback.recipe
+        or metadata.primary_entity_id != fallback.primary_entity_id
     ):
         return fallback
-    entities = {entity.entity_id: entity for entity in _parse_metadata_entities(metadata.get("entities"))}
+    entities = {entity.entity_id: entity for entity in metadata.entities}
     selected = [
         replace(entities[entity.entity_id], role=entity.role) if entity.entity_id in entities else entity
         for entity in fallback.entities
@@ -100,8 +99,20 @@ def restore_recording_context(fallback: RecordingContext, metadata: Mapping[str,
         primary_entity_id=fallback.primary_entity_id,
         device_type=fallback.device_type,
         entities=selected,
-        device_entities=_parse_metadata_entities(metadata.get("device_entities")),
-        related_device_ids=_parse_strings(metadata.get("related_device_ids")),
+        device_entities=metadata.device_entities,
+        related_device_ids=metadata.related_device_ids,
+    )
+
+
+def _parse_metadata(record: Mapping[str, object]) -> RecordingMetadata:
+    recipe = record.get("recipe")
+    primary_entity_id = record.get("primary_entity_id")
+    return RecordingMetadata(
+        recipe=recipe if isinstance(recipe, str) else None,
+        primary_entity_id=primary_entity_id if isinstance(primary_entity_id, str) else None,
+        entities=_parse_metadata_entities(record.get("entities")),
+        device_entities=_parse_metadata_entities(record.get("device_entities")),
+        related_device_ids=_parse_strings(record.get("related_device_ids")),
     )
 
 

@@ -4,9 +4,9 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-from measure.analyser.models import UNEXPLAINED_ACTIVITY, ActivityReport, EnergyMetrics
+from measure.analyser.models import ActivityReport, EnergyMetrics
 from measure.analyser.sample_intervals import calculate_sample_durations
-from measure.analyser.vacuum import VacuumCompositeCandidate, VacuumEpisode, group_vacuum_episodes
+from measure.analyser.vacuum import FixedBranch, VacuumCompositeCandidate, VacuumEpisode, group_vacuum_episodes
 from measure.analyser.vacuum_signals import Activity
 from measure.recording.models import RecordingSample
 
@@ -40,7 +40,7 @@ class _ActivityValidation:
             if id(sample) in transition_ids:
                 transition_errors.append(error)
         return ActivityReport(
-            activity=activity.value if activity is not None else UNEXPLAINED_ACTIVITY,
+            activity=activity,
             sample_count=sum(len(episode.samples) for episode in self.episodes),
             episode_count=len(self.episodes),
             validation_count=len(self.samples),
@@ -69,7 +69,7 @@ def build_activity_reports(
         power = candidate.estimate_activity_power(sample, activity)
         if power is not None:
             data.predictions[id(sample)] = power
-    fixed_activities = {branch.activity for branch in candidate.branches if branch.power is not None}
+    fixed_activities = {branch.activity for branch in candidate.branches if isinstance(branch, FixedBranch)}
     return [
         data.build_report(activity, samples, has_fixed_power=activity in fixed_activities)
         for activity, data in grouped.items()
@@ -80,7 +80,7 @@ def find_credibility_failure(reports: Sequence[ActivityReport]) -> str | None:
     total = sum(report.sample_count for report in reports)
     for report in reports:
         activity = report.activity
-        if activity == UNEXPLAINED_ACTIVITY:
+        if activity is None:
             if report.sample_count <= MAX_UNEXPLAINED_SHARE * total:
                 continue
             return (

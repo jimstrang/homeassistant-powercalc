@@ -16,6 +16,18 @@ RECORDING_ANALYSIS_LABEL = "Recording analysis"
 UNEXPLAINED_ACTIVITY = "unexplained"
 
 
+class Activity(StrEnum):
+    AUTO_EMPTYING = "auto_emptying"
+    STATION_CLEANING = "station_cleaning"
+    WASHING = "washing"
+    DRYING = "drying"
+    CHARGING = "charging"
+    SLEEPING = "sleeping"
+    COMPLETED = "completed"
+    DOCKED = "docked"
+    AWAY = "away"
+
+
 class FeatureSource(StrEnum):
     STATE = "state"
     ATTRIBUTE = "attribute"
@@ -174,7 +186,7 @@ class EnergyMetrics:
 class ActivityReport:
     """Validation results for one vacuum activity, or unexplained samples."""
 
-    activity: str
+    activity: Activity | None
     sample_count: int
     episode_count: int
     validation_count: int
@@ -188,7 +200,7 @@ class ActivityReport:
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "activity": self.activity,
+            "activity": self.activity.value if self.activity is not None else UNEXPLAINED_ACTIVITY,
             "sample_count": self.sample_count,
             "episode_count": self.episode_count,
             "validation_count": self.validation_count,
@@ -282,7 +294,7 @@ class RecorderAnalysisResult:
                 "Validation coverage": f"{self.metrics.coverage:.0%}",
                 "Validation method": self.validation_method.value if self.validation_method else "held-out episodes",
                 "Recorded activities": ", ".join(
-                    report.activity for report in self.activity_reports if report.activity != UNEXPLAINED_ACTIVITY
+                    report.activity for report in self.activity_reports if report.activity is not None
                 ),
             }
         fixed_config = self.model_config_fragment.configuration

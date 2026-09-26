@@ -22,7 +22,7 @@ from measure.analyser.models import (
 from measure.analyser.recording import load_recordings, restore_recording_context
 from measure.analyser.vacuum import VacuumCompositeCandidate, VacuumCompositeStrategy, split_vacuum_samples
 from measure.analyser.vacuum_validation import build_activity_reports, find_credibility_failure
-from measure.recording.models import RecordingContext, RecordingSample
+from measure.recording.models import RecorderProfileRecipe, RecordingContext, RecordingSample
 
 MIN_VALIDATION_COVERAGE = 0.9
 MIN_RELATIVE_MAE_IMPROVEMENT = 0.15
@@ -89,7 +89,7 @@ class RecorderAnalyser:
             return self.strategies
         # Vacuum recipes require independent cycles and runtime signals; they
         # must not fall back to adjacent-sample fixed validation.
-        is_vacuum = context.recipe == "vacuum_robot"
+        is_vacuum = context.recipe == RecorderProfileRecipe.VACUUM_ROBOT
         return [strategy for strategy in self.strategies if (strategy.strategy_id == "vacuum_composite") == is_vacuum]
 
 
@@ -122,7 +122,7 @@ def _evaluate_strategy(
 def _split_analysis_samples(
     samples: Sequence[RecordingSample], context: RecordingContext
 ) -> TrainingValidationSplit | StrategyNotApplicable:
-    if context.recipe == "vacuum_robot":
+    if context.recipe == RecorderProfileRecipe.VACUUM_ROBOT:
         if any(sample.power < 0 for sample in samples):
             return StrategyNotApplicable("Vacuum power must be non-negative; check the meter or dummy-load correction")
         return split_vacuum_samples(samples, context)

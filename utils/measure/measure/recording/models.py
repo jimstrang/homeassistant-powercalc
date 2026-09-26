@@ -3,6 +3,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 
 
+class RecorderProfileRecipe(StrEnum):
+    GENERIC = "generic"
+    VACUUM_ROBOT = "vacuum_robot"
+
+
 class EntityRole(StrEnum):
     PRIMARY = "primary"
     BATTERY = "battery"
@@ -65,7 +70,7 @@ class RecordingSample:
 class RecordingContext:
     """Recipe and device identity shared by recording and offline analysis."""
 
-    recipe: str
+    recipe: RecorderProfileRecipe
     primary_entity_id: str
     device_type: str
     entities: list[RecordedEntity]
@@ -89,9 +94,20 @@ class RecordingContext:
 
 
 @dataclass(frozen=True)
+class RecordingMetadata:
+    """Parsed header; unknown recipe names remain readable for compatibility checks."""
+
+    recipe: str | None
+    primary_entity_id: str | None
+    entities: list[RecordedEntity] = field(default_factory=list)
+    device_entities: list[RecordedEntity] = field(default_factory=list)
+    related_device_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class RecordingDataset:
     samples: list[RecordingSample]
-    metadata: Mapping[str, object] | None = None
+    metadata: RecordingMetadata | None = None
 
 
 @dataclass(frozen=True)

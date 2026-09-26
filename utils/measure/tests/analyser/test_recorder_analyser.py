@@ -15,11 +15,17 @@ from measure.analyser.models import (
 )
 from measure.analyser.recording import load_recording
 from measure.analyser.service import RecorderAnalyser, _find_model_credibility_failure, _select_candidate
-from measure.recording.models import RecordedEntity, RecordedEntityState, RecordingContext, RecordingSample
+from measure.recording.models import (
+    RecordedEntity,
+    RecordedEntityState,
+    RecorderProfileRecipe,
+    RecordingContext,
+    RecordingSample,
+)
 import pytest
 
 CONTEXT = RecordingContext(
-    recipe="generic",
+    recipe=RecorderProfileRecipe.GENERIC,
     primary_entity_id="switch.device",
     device_type="generic_iot",
     entities=[RecordedEntity("switch.device", "switch", "primary")],
@@ -43,7 +49,7 @@ RECORDER_REGRESSION_CASES = (
     RecorderRegressionCase(
         fixture="set_top_box_two_states.jsonl",
         context=RecordingContext(
-            recipe="generic",
+            recipe=RecorderProfileRecipe.GENERIC,
             primary_entity_id="media_player.kpn_diw7022",
             device_type="generic_iot",
             entities=[RecordedEntity("media_player.kpn_diw7022", "media_player", "primary")],

@@ -9,7 +9,13 @@ from measure.analyser.vacuum_signals import (
     discover_signals,
     resolve_activity,
 )
-from measure.recording.models import RecordedEntity, RecordedEntityState, RecordingContext, RecordingSample
+from measure.recording.models import (
+    RecordedEntity,
+    RecordedEntityState,
+    RecorderProfileRecipe,
+    RecordingContext,
+    RecordingSample,
+)
 import pytest
 
 PRIMARY = "vacuum.robot"
@@ -17,7 +23,7 @@ PRIMARY = "vacuum.robot"
 
 def context(*entities: RecordedEntity) -> RecordingContext:
     return RecordingContext(
-        "vacuum_robot",
+        RecorderProfileRecipe.VACUUM_ROBOT,
         PRIMARY,
         "vacuum_robot",
         [

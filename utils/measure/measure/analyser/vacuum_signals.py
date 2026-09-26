@@ -2,25 +2,12 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from enum import IntEnum, StrEnum
+from enum import IntEnum
 import json
 
 from measure.analyser.entity_references import resolve_portable_entity
-from measure.analyser.models import FeatureReference, FeatureSource, ScalarStateValue
+from measure.analyser.models import Activity as Activity, FeatureReference, FeatureSource, ScalarStateValue
 from measure.recording.models import EntityRole, RecordedEntity, RecordingContext, RecordingSample
-
-
-class Activity(StrEnum):
-    AUTO_EMPTYING = "auto_emptying"
-    STATION_CLEANING = "station_cleaning"
-    WASHING = "washing"
-    DRYING = "drying"
-    CHARGING = "charging"
-    SLEEPING = "sleeping"
-    COMPLETED = "completed"
-    DOCKED = "docked"
-    AWAY = "away"
-
 
 # The first matching activity determines total wall-outlet power.
 ACTIVITY_PRIORITY = (

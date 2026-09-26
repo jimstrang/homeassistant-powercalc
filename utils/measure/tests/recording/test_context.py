@@ -57,6 +57,7 @@ def test_vacuum_context_records_selected_metadata_and_complete_device_inventory(
         ),
     ]
     context = build_recording_context(request, descriptors)
+    assert context.recipe is RecorderProfileRecipe.VACUUM_ROBOT
     assert context.entities[0].role is EntityRole.PRIMARY
     assert context.entities[1].role is EntityRole.BATTERY
     assert context.entities[2].role is EntityRole.TRACKED
@@ -71,6 +72,7 @@ def test_vacuum_context_records_selected_metadata_and_complete_device_inventory(
     assert inventory[2]["has_live_state"] is False
     assert inventory[2]["disabled_by"] == "integration"
     serialized = json.loads(json.dumps(context.build_metadata_record()))
+    assert serialized["recipe"] == "vacuum_robot"
     assert [entity["role"] for entity in serialized["entities"]] == ["primary", "battery", "tracked"]
     assert [entity["role"] for entity in serialized["device_entities"]] == ["available", "available", "disabled"]
 
@@ -91,6 +93,7 @@ def test_recording_context_maps_generic_and_vacuum_recipes() -> None:
     )
 
     assert build_recording_context(generic).device_type == "generic_iot"
+    assert build_recording_context(generic).recipe is RecorderProfileRecipe.GENERIC
     assert generic.generate_model_json is False
     vacuum_context = build_recording_context(vacuum)
     assert vacuum_context.device_type == "vacuum_robot"

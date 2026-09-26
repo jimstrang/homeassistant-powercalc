@@ -97,7 +97,8 @@ validation types live in [analyser/models.py](measure/analyser/models.py).
 | --- | --- |
 | `RecordedEntity` | Captured identity: ID, domain, role, device ID, translation key, device class, unit, disabled/live-state information. |
 | `EntityRole` | Named primary, battery, tracked, available, and disabled roles; serialized as strings. |
-| `RecordingContext` | Recipe, primary ID, device type, selected metadata, and same-device inventory. |
+| `RecorderProfileRecipe` / `RecordingContext` | Typed recipe, primary ID, device type, selected metadata, and same-device inventory. |
+| `RecordingMetadata` | Parsed header with selected entities, device inventory, and related device IDs. |
 | `RecordedEntityState` | One recorded state plus attributes. |
 | `RecordingSample` | Elapsed seconds, measured watts, entity map, and source `recording_id`. |
 | `RecordingDataset` / `LoadedRecording` | Parsed sample collection, metadata, and invalid-line warnings. |
@@ -112,7 +113,10 @@ validation types live in [analyser/models.py](measure/analyser/models.py).
 
 [recording.py](measure/analyser/recording.py) accepts current typed JSONL and older samples
 without `record_type`. Malformed samples are skipped with warnings; valid elapsed times and
-power must be finite. Samples are immutable and retain all recorded entities.
+power must be finite. Samples are immutable and retain all recorded entities. Headers are
+parsed once into `RecordingMetadata`; missing fields are tolerated and unknown recipe names
+remain available for compatibility checks. Active contexts retain `RecorderProfileRecipe`,
+which is defined with the recording models and re-exported from `request.py`.
 
 `restore_recording_context()` enriches the request's selected entities with captured registry
 metadata, preserving recipe, primary selection, and roles for offline reanalysis.
@@ -196,8 +200,10 @@ models export `states_power`. Attribute keys use the form `attribute|value`.
 [vacuum_signals.py](measure/analyser/vacuum_signals.py) recognises runtime activities:
 auto-emptying, station cleaning, washing, drying, charging, sleeping, charging completed,
 docked, and operation away from the dock. Aliases normalise integration-specific labels.
-`Activity` is the shared string enum for signals, branches and episodes;
-`ACTIVITY_PRIORITY` defines their matching order. Recording labels and JSON reports use strings.
+`Activity`, defined in the analyser models, is the shared string enum for signals, branches,
+episodes and reports; `ACTIVITY_PRIORITY` defines their matching order. Unidentified activity
+is represented internally by `None`, exported as `"unexplained"`. Recording labels and JSON
+reports continue to use strings.
 
 Signal priority is recognised runtime action entities, then primary activity flags.
 Remaining activities use one enum source: related `state`, related `status`, primary
@@ -232,9 +238,11 @@ intervals, fitting falls back to the arithmetic mean. Charging gets a bounded pi
 - Require at least three supported bins, 20 percentage points of span, and no gap over
   20 percentage points. Predictions are bounded to the fitted range.
 
-`VacuumBranch` stores either fixed power or `ChargingPoint` values with named battery-level
-and power fields. `ActivitySignal` stores its
-feature and observed active/inactive values, and builds equivalent configuration conditions.
+`VacuumBranch` is the union of `FixedBranch`, with a required fixed power, and
+`ChargingBranch`, with required `ChargingPoint` values. A charging curve validates that it
+has at least two points with strictly increasing battery levels before interpolation.
+`ActivitySignal` stores its feature and observed active/inactive values, and builds equivalent
+configuration conditions.
 Boolean attributes use identity comparisons to distinguish booleans from numeric enums.
 
 Export uses `stop_at_first`: guards enforce activity priority, including overlapping or
