@@ -67,15 +67,15 @@ class FixedStatesPowerCandidate:
 class FixedStatesPowerStrategy(ProfileAnalysisStrategy):
     strategy_id = "fixed_states_power"
 
-    def build_candidate(
+    def build_candidates(
         self,
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],  # Unused: a fixed profile resolves no vacuum activities.
         *,
         recording_samples: Sequence[RecordingSample] | None = None,
-    ) -> AnalysisCandidate | StrategyNotApplicable:
-        candidates = [
+    ) -> list[AnalysisCandidate] | StrategyNotApplicable:
+        candidates: list[AnalysisCandidate] = [
             candidate
             for feature in _collect_features(samples, context.primary_entity_id)
             if (candidate := _fit_feature(samples, feature)) is not None
@@ -85,10 +85,7 @@ class FixedStatesPowerStrategy(ProfileAnalysisStrategy):
                 f"No state or scalar attribute had 2-{MAX_DISTINCT_VALUES} usable values with at least "
                 f"{MIN_SAMPLES_PER_VALUE} training samples per value",
             )
-        return min(
-            candidates,
-            key=lambda candidate: (_calculate_training_mae(candidate, samples), candidate.feature.identifier),
-        )
+        return candidates
 
 
 def _collect_features(samples: Sequence[RecordingSample], primary_entity_id: str) -> list[FeatureReference]:
@@ -123,10 +120,3 @@ def _fit_feature(
 
 def _is_usable(value: ScalarStateValue) -> bool:
     return not isinstance(value, str) or value.casefold() not in _IGNORED_VALUES
-
-
-def _calculate_training_mae(candidate: FixedStatesPowerCandidate, samples: Sequence[RecordingSample]) -> float:
-    errors = [
-        abs(estimate - sample.power) for sample in samples if (estimate := candidate.estimate_power(sample)) is not None
-    ]
-    return sum(errors) / len(errors)

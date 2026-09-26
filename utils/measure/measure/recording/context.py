@@ -41,7 +41,7 @@ def build_recording_context(
         if entity.device_id in inventory_device_ids
     ]
     return RecordingContext(
-        recipe=request.profile_recipe.value,
+        recipe=request.profile_recipe,
         primary_entity_id=entity_ids[0],
         device_type="vacuum_robot" if request.profile_recipe == RecorderProfileRecipe.VACUUM_ROBOT else "generic_iot",
         entities=[

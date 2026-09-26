@@ -42,7 +42,7 @@ observations; the result and preparation screens consume its artifacts.
 | Measurement mode | How measurements are obtained: recorder, controlled light measurements, charging, average, etc. |
 | Recorder purpose | `playbook` or `complex_profile`; determines the artifact and whether automatic analysis runs. |
 | Recorder recipe | `generic` or `vacuum_robot`; selects entity requirements and the applicable offline model family/validation policy. |
-| Analysis strategy | A model-fitting algorithm in `measure/analyser/`. Builds a fitted candidate from training samples. |
+| Analysis strategy | A model-fitting algorithm in `measure/analyser/`. Builds fitted candidates from training samples. |
 | Candidate / fitted model | A Python object containing learned parameters and rules; predicts sample power and exports a config fragment. |
 | Composite profile | An output model configuration containing ordered conditional branches. |
 | Activity / episode | A semantic vacuum/dock activity and a run of observations belonging to it. Used for fitting and independent validation. |
@@ -97,7 +97,8 @@ validation types live in [analyser/models.py](measure/analyser/models.py).
 | --- | --- |
 | `RecordedEntity` | Captured identity: ID, domain, role, device ID, translation key, device class, unit, disabled/live-state information. |
 | `EntityRole` | Named primary, battery, tracked, available, and disabled roles; serialized as strings. |
-| `RecordingContext` | Recipe, primary ID, device type, selected metadata, and same-device inventory. |
+| `RecorderProfileRecipe` / `RecordingContext` | Typed recipe, primary ID, device type, selected metadata, and same-device inventory. |
+| `RecordingMetadata` | Parsed header with selected entities, device inventory, and related device IDs. |
 | `RecordedEntityState` | One recorded state plus attributes. |
 | `RecordingSample` | Elapsed seconds, measured watts, entity map, and source `recording_id`. |
 | `RecordingDataset` / `LoadedRecording` | Parsed sample collection, metadata, and invalid-line warnings. |
@@ -106,18 +107,21 @@ validation types live in [analyser/models.py](measure/analyser/models.py).
 | `FeatureReference` | A selected entity's state or one scalar attribute; knows how to read a sample. |
 | `AnalysisMetrics` | Validation count, coverage, MAE, RMSE, and observed power range. |
 | `ActivityReport` / `EnergyMetrics` | Per-activity validation evidence and measured/predicted energy. |
-| `EvaluatedCandidate` | A fitted candidate together with its metrics and activity reports. |
+| `EvaluatedCandidate` / `AnalysisFailure` | A validated candidate or its rejection reason, together with the corresponding activity reports. |
 | `ModelConfigFragment` | Exportable strategy-specific configuration. |
 | `RecorderAnalysisResult` | Accepted candidate/config or actionable insufficient-data reason, plus validation evidence. |
 
 [recording.py](measure/analyser/recording.py) accepts current typed JSONL and older samples
 without `record_type`. Malformed samples are skipped with warnings; valid elapsed times and
-power must be finite. Samples are immutable and retain all recorded entities.
+power must be finite. Samples are immutable and retain all recorded entities. Headers are
+parsed once into `RecordingMetadata`; missing fields are tolerated and unknown recipe names
+remain available for compatibility checks. Active contexts retain `RecorderProfileRecipe`,
+which is defined with the recording models and re-exported from `request.py`.
 
 `restore_recording_context()` enriches the request's selected entities with captured registry
 metadata, preserving recipe, primary selection, and roles for offline reanalysis.
 
-`load_recordings()` combines compatible files and assigns source IDs. Currently, typed
+`load_recordings()` reads compatible files sequentially and assigns source IDs during parsing. Currently, typed
 headers must agree on recipe, primary entity, and selected entity metadata, apart from
 live availability and disabled status, which can change between runs.
 
@@ -148,22 +152,24 @@ Candidates export their parameters and rules as JSON configuration.
 2. Choose the recipe's training/validation split.
 3. Ask applicable strategies to build candidates from **training** samples.
 4. Predict held-out samples and calculate errors/coverage.
-5. Compare against a constant-power baseline and enforce support/credibility requirements.
+5. Enforce generic baseline/support requirements or vacuum activity-level credibility checks.
 6. Select an accepted candidate and request its export fragment.
 
 Generic requests use the fixed fitter; vacuum requests use the vacuum fitter and
 episode-based validation. `RecorderAnalysisExecution` persists results and updates summaries.
 
-`ProfileAnalysisStrategy.build_candidate(samples, context)` returns an `AnalysisCandidate`
-or `StrategyNotApplicable(reason)`. The strategy owns feature discovery, fitting, and
-applicability checks.
+`ProfileAnalysisStrategy.build_candidates(samples, context, signals, recording_samples=...)`
+returns a list of fitted candidates or `StrategyNotApplicable(reason)`. The strategy owns
+feature discovery, fitting, and applicability checks. The full recording preserves interval
+boundaries when fitting a training subset; discovered signals preserve the vocabulary used
+to split vacuum episodes.
 
 The candidate exposes:
 
 - `features`: all model inputs; `feature` remains a deterministic anchor for legacy reports
   and selection tie-breaking.
 - `estimate_power(sample)`: fitted prediction, or `None` for an uncovered sample.
-- `support_key(sample)`: the fitted category/activity whose observations count as support.
+- `get_support_key(sample)`: the fitted category/activity whose observations count as support.
 - `complexity`: a simple parameter-count proxy for model selection.
 - `standby_power`: an explicitly measured standby value where available.
 - `build_model_config_fragment()`: export of the fitted rules/parameters as profile configuration.
@@ -171,8 +177,8 @@ The candidate exposes:
 Prediction and export must agree on missing values, integer conversion, branch precedence,
 and range guards.
 
-Common acceptance thresholds currently require 90% validation coverage, at least five
-covered samples per model value/activity, at least 0.1 W prediction range, and a reduction
+Generic acceptance thresholds require 90% validation coverage, at least five
+covered samples per model value, at least 0.1 W prediction range, and a reduction
 in baseline MAE of at least 0.1 W **or** 15%. The baseline predicts the median training power.
 When several model families are accepted, a more complex candidate needs at least 0.1 W
 **and** 15% improvement over the simpler one. These thresholds are engineering heuristics.
@@ -182,7 +188,8 @@ When several model families are accepted, a more complex candidate needs at leas
 [FixedStatesPowerStrategy](measure/analyser/fixed.py) examines the primary entity's state
 and scalar attributes. It supports 2–20 distinct usable values with at least four training
 samples each. Each value gets the median observed training power, rounded to two decimals.
-It chooses its best feature by training MAE; the analyser then validates that candidate.
+Every fitted feature goes through validation before selection. A sparse attribute cannot
+discard a credible state model merely because it has a lower training error on fewer samples.
 Generic validation preserves the existing deterministic every-fifth-sample holdout.
 
 An `on`/`off` lookup table can export `fixed_config.power` with explicit standby; other
@@ -193,8 +200,10 @@ models export `states_power`. Attribute keys use the form `attribute|value`.
 [vacuum_signals.py](measure/analyser/vacuum_signals.py) recognises runtime activities:
 auto-emptying, station cleaning, washing, drying, charging, sleeping, charging completed,
 docked, and operation away from the dock. Aliases normalise integration-specific labels.
-`Activity` is the shared string enum for signals, branches and episodes;
-`ACTIVITY_PRIORITY` defines their matching order. Recording labels and JSON reports use strings.
+`Activity`, defined in the analyser models, is the shared string enum for signals, branches,
+episodes and reports; `ACTIVITY_PRIORITY` defines their matching order. Unidentified activity
+is represented internally by `None`, exported as `"unexplained"`. Recording labels and JSON
+reports continue to use strings.
 
 Signal priority is recognised runtime action entities, then primary activity flags.
 Remaining activities use one enum source: related `state`, related `status`, primary
@@ -211,14 +220,16 @@ charging and sleeping signals fill specific gaps. Unknown inputs remain uncovere
 Station idle leaves the primary activity in control. `docked` alone does not identify
 charging or completion. Errors and unrecognised modes require better runtime signals.
 
-Portable related references require recorded same-device metadata and uniqueness across
-the captured device inventory, including disabled duplicates. The exporter uses
-`[[entity]]`, `[[entity_by_translation_key:…]]`, or an unambiguous battery device-class
-placeholder. Separate-device dock references are deferred beyond the MVP.
+[entity_references.py](measure/analyser/entity_references.py) resolves portable references
+using captured registry metadata and inventory, including disabled duplicates. The exporter
+uses `[[entity]]`, `[[entity_by_translation_key:…]]`, or an unambiguous battery device-class
+placeholder. Related dock entities are supported when no matching entity on the primary
+device shadows them and exactly one match exists across related devices.
 
 [VacuumCompositeStrategy](measure/analyser/vacuum.py) groups training observations by the
-first matching activity in dock-priority order. Non-charging activities get a median fixed
-**total wall-outlet power**. Charging gets a bounded piecewise-linear battery calibration:
+first matching activity in dock-priority order. Non-charging activities get a time-weighted mean fixed
+**total wall-outlet power**, preserving energy for cycling loads. Without consecutive usable
+intervals, fitting falls back to the arithmetic mean. Charging gets a bounded piecewise-linear battery calibration:
 
 - Prefer the selected portable battery sensor; legacy recordings may use a matching
   primary `battery_level` attribute instead.
@@ -227,9 +238,11 @@ first matching activity in dock-priority order. Non-charging activities get a me
 - Require at least three supported bins, 20 percentage points of span, and no gap over
   20 percentage points. Predictions are bounded to the fitted range.
 
-`VacuumBranch` stores either fixed power or `ChargingPoint` values with named battery-level
-and power fields. `ActivitySignal` stores its
-feature and observed active/inactive values, and builds equivalent configuration conditions.
+`VacuumBranch` is the union of `FixedBranch`, with a required fixed power, and
+`ChargingBranch`, with required `ChargingPoint` values. A charging curve validates that it
+has at least two points with strictly increasing battery levels before interpolation.
+`ActivitySignal` stores its feature and observed active/inactive values, and builds equivalent
+configuration conditions.
 Boolean attributes use identity comparisons to distinguish booleans from numeric enums.
 
 Export uses `stop_at_first`: guards enforce activity priority, including overlapping or
@@ -246,12 +259,16 @@ at least five samples each. Episodes change at activity or recording boundaries.
 unexplained episodes remain in validation.
 
 When compatible source files contain all activities on both sides, the last recording is
-held out in full. Otherwise, alternate qualifying episodes of each activity are held out.
+held out in full if it covers at least 10% of every activity's eligible recorded time.
+Otherwise, alternate qualifying episodes of each activity are held out.
 Training and validation use separate episodes, providing a check on repeated-cycle behaviour.
 
 [vacuum_validation.py](measure/analyser/vacuum_validation.py) reports each activity's sample
 and episode counts, coverage, MAE, transition MAE, and energy. Each activity must have 90%
-coverage and MAE no greater than the larger of 0.5 W and 20% of its mean validation power.
+coverage. Fixed activities require consecutive readings and compare measured versus predicted
+time-weighted average power; charging compares per-sample MAE. Both allow at most the larger
+of 0.5 W and 20% of their measured average power. Vacuum acceptance uses these activity checks;
+the overall MAE and constant-power baseline do not veto a repeatable cycling load.
 Samples matching no activity are tolerated up to 10% of the recording, so a brief
 unavailable blip or transient state does not reject it; beyond that acceptance fails.
 These checks keep long low-power periods from masking a poor short, high-power dock cycle.
@@ -263,8 +280,9 @@ interpret overall error.
 Energy uses trapezoidal integration between adjacent covered validation samples of the
 same activity and recording, only for positive gaps up to 30 seconds. Reports include the
 actual integrated duration, measured/predicted Wh, and signed energy bias. Integration stops
-at uncovered samples, larger gaps, or activity boundaries. Energy and transition errors
-provide supplementary diagnostics.
+at uncovered samples, larger gaps, or activity boundaries. Activity groups and predictions
+are reused while building reports. Checks use full-precision metrics; rounding happens only
+when serializing the report. Transition errors remain supplementary diagnostics.
 
 ## 10. Execution, reanalysis, and profile preparation
 

@@ -8,7 +8,9 @@ from itertools import pairwise
 import math
 from statistics import mean, median
 
+from measure.analyser.entity_references import resolve_portable_entity
 from measure.analyser.models import (
+    AnalysisCandidate,
     FeatureReference,
     FeatureSource,
     ModelConfigFragment,
@@ -24,9 +26,8 @@ from measure.analyser.vacuum_signals import (
     discover_signals,
     find_battery_feature,
     resolve_activity,
-    resolve_portable_entity,
 )
-from measure.recording.models import RecordingContext, RecordingSample
+from measure.recording.models import RecorderProfileRecipe, RecordingContext, RecordingSample
 
 MIN_EPISODE_SAMPLES = 5
 MAX_CHARGING_GAP = 20
@@ -46,18 +47,34 @@ class ChargingPoint:
 
 
 @dataclass(frozen=True)
-class VacuumBranch:
+class FixedBranch:
     activity: Activity
-    power: float | None = None
-    calibration: list[ChargingPoint] = field(default_factory=list)
+    power: float
 
     @property
     def complexity(self) -> int:
-        return len(self.calibration) if self.calibration else 1
+        return 1
+
+    def estimate(self, sample: RecordingSample, battery: FeatureReference | None) -> float:
+        return self.power
+
+
+@dataclass(frozen=True)
+class ChargingBranch:
+    calibration: list[ChargingPoint]
+    activity: Activity = field(default=Activity.CHARGING, init=False)
+
+    def __post_init__(self) -> None:
+        if len(self.calibration) < 2:
+            raise ValueError("A charging curve needs at least two calibration points")
+        if any(right.battery_level <= left.battery_level for left, right in pairwise(self.calibration)):
+            raise ValueError("Charging calibration battery levels must be strictly increasing")
+
+    @property
+    def complexity(self) -> int:
+        return len(self.calibration)
 
     def estimate(self, sample: RecordingSample, battery: FeatureReference | None) -> float | None:
-        if self.power is not None:
-            return self.power
         value = get_battery_level(sample, battery)
         if value is None or not self.calibration[0].battery_level <= value <= self.calibration[-1].battery_level:
             return None
@@ -66,6 +83,9 @@ class VacuumBranch:
         left, right = self.calibration[index - 1], self.calibration[index]
         fraction = (value - left.battery_level) / (right.battery_level - left.battery_level)
         return left.power + (right.power - left.power) * fraction
+
+
+type VacuumBranch = FixedBranch | ChargingBranch
 
 
 @dataclass(frozen=True)
@@ -97,7 +117,7 @@ class VacuumCompositeCandidate:
         # arbitrary sample, and never an unmeasured zero fallback.
         for activity in (Activity.SLEEPING, Activity.DOCKED):
             for branch in self.branches:
-                if branch.activity == activity:
+                if isinstance(branch, FixedBranch) and branch.activity == activity:
                     return branch.power
         return None
 
@@ -105,11 +125,18 @@ class VacuumCompositeCandidate:
         return resolve_activity(sample, self.signals)
 
     def estimate_power(self, sample: RecordingSample) -> float | None:
-        activity = self.get_support_key(sample)
+        return self.estimate_activity_power(sample, self.get_support_key(sample))
+
+    def estimate_activity_power(self, sample: RecordingSample, activity: Activity | None) -> float | None:
+        """Estimate a sample whose activity has already been resolved."""
         for branch in self.branches:
             # Composite checks an overridden source's availability before its
             # condition, including when it would otherwise skip charging.
-            if branch.calibration and self.battery is not None and self.battery.source == FeatureSource.STATE:
+            if (
+                isinstance(branch, ChargingBranch)
+                and self.battery is not None
+                and self.battery.source == FeatureSource.STATE
+            ):
                 state = sample.entities.get(self.battery.entity_id)
                 if state is None or state.state in {"unknown", "unavailable"}:
                     return None
@@ -137,7 +164,7 @@ class VacuumCompositeCandidate:
         ]
         conditions.append(signal.build_condition(self.context))
         item: dict[str, object] = {}
-        if branch.calibration:
+        if isinstance(branch, ChargingBranch):
             assert self.battery is not None
             entity_id = resolve_portable_entity(self.battery.entity_id, self.context)
             assert entity_id is not None
@@ -158,15 +185,15 @@ class VacuumCompositeCandidate:
 class VacuumCompositeStrategy(ProfileAnalysisStrategy):
     strategy_id = "vacuum_composite"
 
-    def build_candidate(
+    def build_candidates(
         self,
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],
         *,
         recording_samples: Sequence[RecordingSample] | None = None,
-    ) -> VacuumCompositeCandidate | StrategyNotApplicable:
-        if context.recipe != "vacuum_robot":
+    ) -> list[AnalysisCandidate] | StrategyNotApplicable:
+        if context.recipe != RecorderProfileRecipe.VACUUM_ROBOT:
             return StrategyNotApplicable("The vacuum analyser requires the vacuum recipe")
         grouped: dict[Activity, list[RecordingSample]] = defaultdict(list)
         for sample in samples:
@@ -187,7 +214,7 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
             if isinstance(branch, StrategyNotApplicable):
                 return branch
             branches.append(branch)
-        return VacuumCompositeCandidate(list(signals), branches, battery, context)
+        return [VacuumCompositeCandidate(list(signals), branches, battery, context)]
 
 
 def _fit_branch(
@@ -202,7 +229,7 @@ def _fit_branch(
         return _fit_charging_branch(samples, battery)
     # A fixed power must preserve energy: a median would pick the heater-on level of
     # a cycling dryer, or ignore the start-up ramp of a short bin emptying.
-    return VacuumBranch(activity, round(calculate_average_power(samples, durations), 2))
+    return FixedBranch(activity, round(calculate_average_power(samples, durations), 2))
 
 
 def calculate_average_power(samples: Sequence[RecordingSample], durations: Mapping[int, float]) -> float:
@@ -228,7 +255,7 @@ def get_battery_level(sample: RecordingSample, feature: FeatureReference | None)
         return None
 
 
-def _build_charging_condition(branch: VacuumBranch, battery: FeatureReference, entity_id: str) -> dict[str, object]:
+def _build_charging_condition(branch: ChargingBranch, battery: FeatureReference, entity_id: str) -> dict[str, object]:
     # Guard the calibrated range: PowerCalc otherwise extrapolates. Reject
     # missing, boolean, non-finite and non-numeric values before integer coercion.
     expression = (
@@ -252,7 +279,7 @@ def _build_charging_condition(branch: VacuumBranch, battery: FeatureReference, e
 
 def _fit_charging_branch(
     samples: Sequence[RecordingSample], battery: FeatureReference | None
-) -> VacuumBranch | StrategyNotApplicable:
+) -> ChargingBranch | StrategyNotApplicable:
     if battery is None:
         return StrategyNotApplicable(
             "Charging needs portable battery metadata or a matching vacuum battery_level attribute"
@@ -279,7 +306,7 @@ def _fit_charging_branch(
         return StrategyNotApplicable(
             "Charging has a battery coverage gap over 20 percentage points; record a continuous charging cycle"
         )
-    return VacuumBranch(Activity.CHARGING, calibration=points)
+    return ChargingBranch(calibration=points)
 
 
 @dataclass(frozen=True)

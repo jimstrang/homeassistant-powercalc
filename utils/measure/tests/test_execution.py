@@ -354,6 +354,7 @@ def test_execution_preserves_recording_when_analysis_fails(tmp_path: Path, caplo
         "Recording analysis reason": "Recording analysis failed: broken analyser",
     }
     assert "Recording analysis failed: broken analyser" in caplog.text
+    assert any(record.exc_info is not None for record in caplog.records)
 
 
 def test_analysis_without_reason_removes_stale_model_and_preserves_recording(tmp_path: Path) -> None:

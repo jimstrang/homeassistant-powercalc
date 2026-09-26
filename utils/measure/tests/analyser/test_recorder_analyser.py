@@ -15,11 +15,17 @@ from measure.analyser.models import (
 )
 from measure.analyser.recording import load_recording
 from measure.analyser.service import RecorderAnalyser, _find_model_credibility_failure, _select_candidate
-from measure.recording.models import RecordedEntity, RecordedEntityState, RecordingContext, RecordingSample
+from measure.recording.models import (
+    RecordedEntity,
+    RecordedEntityState,
+    RecorderProfileRecipe,
+    RecordingContext,
+    RecordingSample,
+)
 import pytest
 
 CONTEXT = RecordingContext(
-    recipe="generic",
+    recipe=RecorderProfileRecipe.GENERIC,
     primary_entity_id="switch.device",
     device_type="generic_iot",
     entities=[RecordedEntity("switch.device", "switch", "primary")],
@@ -43,7 +49,7 @@ RECORDER_REGRESSION_CASES = (
     RecorderRegressionCase(
         fixture="set_top_box_two_states.jsonl",
         context=RecordingContext(
-            recipe="generic",
+            recipe=RecorderProfileRecipe.GENERIC,
             primary_entity_id="media_player.kpn_diw7022",
             device_type="generic_iot",
             entities=[RecordedEntity("media_player.kpn_diw7022", "media_player", "primary")],
@@ -162,9 +168,10 @@ def test_load_recording_skips_unsupported_and_invalid_records(tmp_path: Path, re
 def test_fixed_strategy_builds_a_lookup_candidate_for_primary_state() -> None:
     samples = [sample(index, 0.2 if index % 2 == 0 else 5.2, "off" if index % 2 == 0 else "on") for index in range(8)]
 
-    candidate = FixedStatesPowerStrategy().build_candidate(samples, CONTEXT, [])
+    candidates = FixedStatesPowerStrategy().build_candidates(samples, CONTEXT, [])
 
-    assert not isinstance(candidate, StrategyNotApplicable)
+    assert not isinstance(candidates, StrategyNotApplicable)
+    [candidate] = candidates
     assert candidate.feature == FeatureReference("switch.device", FeatureSource.STATE)
     assert candidate.estimate_power(sample(20, 99, "on")) == pytest.approx(5.2)
     assert candidate.estimate_power(sample(21, 99, "unknown")) is None
@@ -181,7 +188,7 @@ def test_fixed_strategy_builds_a_lookup_candidate_for_primary_state() -> None:
 def test_fixed_strategy_ignores_unavailable_values_and_non_scalar_attributes() -> None:
     samples = [sample(index, 2.0 if index % 2 else 8.0, "unavailable", {"mode": ["invalid"]}) for index in range(8)]
 
-    result = FixedStatesPowerStrategy().build_candidate(samples, CONTEXT, [])
+    result = FixedStatesPowerStrategy().build_candidates(samples, CONTEXT, [])
 
     assert isinstance(result, StrategyNotApplicable)
 
@@ -190,9 +197,10 @@ def test_fixed_strategy_ignores_samples_without_the_primary_entity() -> None:
     samples = [sample(index, 0.2 if index % 2 == 0 else 5.2, "off" if index % 2 == 0 else "on") for index in range(8)]
     missing_entity = RecordingSample(8, 50, {})
 
-    candidate = FixedStatesPowerStrategy().build_candidate([*samples, missing_entity], CONTEXT, [])
+    candidates = FixedStatesPowerStrategy().build_candidates([*samples, missing_entity], CONTEXT, [])
 
-    assert not isinstance(candidate, StrategyNotApplicable)
+    assert not isinstance(candidates, StrategyNotApplicable)
+    [candidate] = candidates
     assert candidate.feature == FeatureReference("switch.device", FeatureSource.STATE)
     assert candidate.estimate_power(sample(9, 0, "off")) == pytest.approx(0.2)
     assert candidate.estimate_power(sample(10, 0, "on")) == pytest.approx(5.2)
@@ -204,9 +212,10 @@ def test_fixed_strategy_keeps_multiple_active_states_as_states_power() -> None:
         sample(index, (2.0, 5.0, 8.0)[index % 3], ("idle", "playing", "recording")[index % 3]) for index in range(12)
     ]
 
-    candidate = FixedStatesPowerStrategy().build_candidate(samples, CONTEXT, [])
+    candidates = FixedStatesPowerStrategy().build_candidates(samples, CONTEXT, [])
 
-    assert not isinstance(candidate, StrategyNotApplicable)
+    assert not isinstance(candidates, StrategyNotApplicable)
+    [candidate] = candidates
     assert candidate.build_model_config_fragment().to_dict() == {
         "calculation_strategy": "fixed",
         "fixed_config": {"states_power": {"idle": 2.0, "playing": 5.0, "recording": 8.0}},
@@ -497,3 +506,21 @@ def test_equal_complexity_selection_is_stable_without_error_improvement(
 
     assert selected.candidate is preferred
     assert selected.metrics.mae_w == 1.0
+
+
+def test_sparse_attribute_does_not_discard_a_credible_state_model(tmp_path: Path) -> None:
+    samples = []
+    for index in range(40):
+        is_on = index % 2 == 0
+        power = (8 if is_on else 2) + (0.2 if index >= 10 and index % 3 == 0 else 0)
+        attributes = {"mode": "boost" if is_on else "eco"} if index < 10 else {}
+        samples.append(sample(index, power, "on" if is_on else "off", attributes))
+    path = tmp_path / "record.jsonl"
+    write_recording(path, samples)
+
+    result = RecorderAnalyser().analyse(path, CONTEXT)
+
+    assert result.model_ready, result.reason
+    assert result.feature == FeatureReference("switch.device", FeatureSource.STATE)
+    assert result.metrics is not None
+    assert result.metrics.coverage == 1

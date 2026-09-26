@@ -2,6 +2,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
+from measure.analyser.entity_references import resolve_portable_entity
 from measure.analyser.execution import RecorderAnalysisExecution
 from measure.analyser.fixed import FixedStatesPowerCandidate
 from measure.analyser.models import (
@@ -10,7 +11,6 @@ from measure.analyser.models import (
     EnergyMetrics,
     FeatureReference,
     FeatureSource,
-    ModelConfigFragment,
     RecorderAnalysisResult,
     StrategyNotApplicable,
     TrainingValidationSplit,
@@ -20,8 +20,9 @@ from measure.analyser.recording import load_recordings, restore_recording_contex
 from measure.analyser.sample_intervals import calculate_sample_durations
 from measure.analyser.service import RecorderAnalyser
 from measure.analyser.vacuum import (
+    ChargingBranch,
     ChargingPoint,
-    VacuumBranch,
+    FixedBranch,
     VacuumCompositeCandidate,
     VacuumCompositeStrategy,
     calculate_average_power,
@@ -34,11 +35,17 @@ from measure.analyser.vacuum_signals import (
     ActivitySignal,
     discover_signals,
     resolve_activity,
-    resolve_portable_entity,
 )
 from measure.analyser.vacuum_validation import build_activity_reports, find_credibility_failure
 from measure.powermeter.spec import DummyPowerMeterSpec
-from measure.recording.models import RecordedEntity, RecordedEntityState, RecordingContext, RecordingSample
+from measure.recording.models import (
+    RecordedEntity,
+    RecordedEntityState,
+    RecorderProfileRecipe,
+    RecordingContext,
+    RecordingMetadata,
+    RecordingSample,
+)
 from measure.request import RecorderMeasurementRequest
 import pytest
 
@@ -47,7 +54,7 @@ BATTERY = "sensor.battery"
 STATE = "sensor.activity"
 DRYING = "binary_sensor.drying"
 CONTEXT = RecordingContext(
-    "vacuum_robot",
+    RecorderProfileRecipe.VACUUM_ROBOT,
     PRIMARY,
     "vacuum_robot",
     [
@@ -169,7 +176,7 @@ def test_insufficient_result_reports_belong_to_the_reason_it_states(tmp_path: Pa
     class NeverApplicable:
         strategy_id = "never_applicable"
 
-        def build_candidate(
+        def build_candidates(
             self,
             samples: list[RecordingSample],
             context: RecordingContext,
@@ -257,9 +264,11 @@ def candidate(
     samples: list[RecordingSample] | None = None, context: RecordingContext = CONTEXT
 ) -> VacuumCompositeCandidate:
     data = samples if samples is not None else cycle()
-    result = VacuumCompositeStrategy().build_candidate(data, context, discover_signals(data, context))
-    assert isinstance(result, VacuumCompositeCandidate)
-    return result
+    result = VacuumCompositeStrategy().build_candidates(data, context, discover_signals(data, context))
+    assert not isinstance(result, StrategyNotApplicable)
+    [model] = result
+    assert isinstance(model, VacuumCompositeCandidate)
+    return model
 
 
 def test_composite_features_preserve_order_without_duplicates() -> None:
@@ -475,7 +484,7 @@ def test_charging_range_integer_conversion_and_attribute_fallback() -> None:
 def test_unsupported_charging_curves(levels: list[int], reason: str) -> None:
     data = [sample("sleeping", 3.5, index) for index in range(5)]
     data += [sample("charging", 20, len(data) + index, level) for level in levels for index in range(3)]
-    result = VacuumCompositeStrategy().build_candidate(data, CONTEXT, discover_signals(data, CONTEXT))
+    result = VacuumCompositeStrategy().build_candidates(data, CONTEXT, discover_signals(data, CONTEXT))
     assert isinstance(result, StrategyNotApplicable)
     assert reason in result.reason
 
@@ -497,7 +506,7 @@ def test_charging_requires_portable_battery_not_entity_name() -> None:
         for item in cycle()
     ]
     bare = replace(CONTEXT, entities=[RecordedEntity(e.entity_id, e.domain, e.role) for e in CONTEXT.entities])
-    result = VacuumCompositeStrategy().build_candidate(data, bare, discover_signals(data, bare))
+    result = VacuumCompositeStrategy().build_candidates(data, bare, discover_signals(data, bare))
     assert isinstance(result, StrategyNotApplicable)
     assert "portable battery metadata" in result.reason
 
@@ -540,6 +549,7 @@ def test_unexplained_episodes_are_held_out_and_reported(tmp_path: Path) -> None:
     assert "20 of 162 samples match no known activity" in str(result.reason)
     assert result.to_dict()["activities"][-1]["activity"] == "unexplained"
     assert result.activity_reports[-1].mae_w is None
+    assert result.activity_reports[-1].activity is None
 
 
 def test_brief_unexplained_blip_does_not_reject_recording(tmp_path: Path) -> None:
@@ -547,7 +557,7 @@ def test_brief_unexplained_blip_does_not_reject_recording(tmp_path: Path) -> Non
     data[15] = replace(sample("unrecognised_mode", 22), elapsed_seconds=data[15].elapsed_seconds)
     result = RecorderAnalyser().analyse(write_recording(tmp_path / "record.jsonl", data), CONTEXT)
     assert result.model_ready
-    assert "unexplained" in {report.activity for report in result.activity_reports}
+    assert None in {report.activity for report in result.activity_reports}
 
 
 def test_energy_only_integrates_adjacent_held_out_samples() -> None:
@@ -563,9 +573,9 @@ def test_strategy_rejections_and_empty_recordings(tmp_path: Path) -> None:
     strategy = VacuumCompositeStrategy()
 
     def build(data: list[RecordingSample], context: RecordingContext = CONTEXT) -> object:
-        return strategy.build_candidate(data, context, discover_signals(data, context))
+        return strategy.build_candidates(data, context, discover_signals(data, context))
 
-    assert isinstance(build(cycle(), replace(CONTEXT, recipe="generic")), StrategyNotApplicable)
+    assert isinstance(build(cycle(), replace(CONTEXT, recipe=RecorderProfileRecipe.GENERIC)), StrategyNotApplicable)
     assert isinstance(build([sample("sleeping", 3.5)] * 10), StrategyNotApplicable)
     result = build([replace(item, power=-1) for item in cycle()])
     assert isinstance(result, StrategyNotApplicable)
@@ -578,7 +588,9 @@ def test_strategy_rejections_and_empty_recordings(tmp_path: Path) -> None:
 
 def test_metadata_validation_and_legacy_loading(tmp_path: Path) -> None:
     path = write_recording(tmp_path / "first.jsonl", cycle())
-    different = write_recording(tmp_path / "second.jsonl", cycle(), replace(CONTEXT, recipe="generic"))
+    different = write_recording(
+        tmp_path / "second.jsonl", cycle(), replace(CONTEXT, recipe=RecorderProfileRecipe.GENERIC)
+    )
     with pytest.raises(ValueError, match="same recipe"):
         load_recordings([path, different])
     with pytest.raises(ValueError, match="at least one"):
@@ -586,28 +598,33 @@ def test_metadata_validation_and_legacy_loading(tmp_path: Path) -> None:
     legacy = write_recording(tmp_path / "legacy.jsonl", cycle(), None)
     assert load_recordings([legacy]).dataset.metadata is None
     assert restore_recording_context(CONTEXT, None) == CONTEXT
-    assert restore_recording_context(CONTEXT, {"recipe": "generic"}) == CONTEXT
-    enriched = restore_recording_context(
-        CONTEXT,
-        {
-            "recipe": "vacuum_robot",
-            "primary_entity_id": PRIMARY,
-            "entities": [
-                None,
-                {"entity_id": 3},
-                {
-                    "entity_id": PRIMARY,
-                    "domain": "vacuum",
-                    "role": "tracked",
-                    "device_id": "new",
-                    "has_live_state": True,
-                    "unit": 8,
-                },
-            ],
-            "device_entities": {},
-            "related_device_ids": ["dock", 5],
-        },
+    assert restore_recording_context(CONTEXT, RecordingMetadata("generic", None)) == CONTEXT
+    metadata_path = tmp_path / "metadata.jsonl"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "record_type": "metadata",
+                "recipe": "vacuum_robot",
+                "primary_entity_id": PRIMARY,
+                "entities": [
+                    None,
+                    {"entity_id": 3},
+                    {
+                        "entity_id": PRIMARY,
+                        "domain": "vacuum",
+                        "role": "tracked",
+                        "device_id": "new",
+                        "has_live_state": True,
+                        "unit": 8,
+                    },
+                ],
+                "device_entities": {},
+                "related_device_ids": ["dock", 5],
+            }
+        ),
+        encoding="utf-8",
     )
+    enriched = restore_recording_context(CONTEXT, load_recordings([metadata_path]).dataset.metadata)
     assert enriched.related_device_ids == ["dock"]
     assert enriched.entities[0].role == "primary"
     assert enriched.entities[0].device_id == "new"
@@ -615,12 +632,9 @@ def test_metadata_validation_and_legacy_loading(tmp_path: Path) -> None:
     assert enriched.entities[0].has_live_state is True
 
 
-def test_fragment_sequence_and_report_serialization() -> None:
+def test_report_serialization() -> None:
     fixed = FixedStatesPowerCandidate(FeatureReference(PRIMARY, FeatureSource.STATE), {"docked": 3, "cleaning": 0.3})
     assert fixed.features == [fixed.feature]
-    assert ModelConfigFragment("composite", "composite_config", [{"fixed": {"power": 2}}]).to_dict()[
-        "composite_config"
-    ] == [{"fixed": {"power": 2}}]
     result = RecorderAnalysisResult(
         AnalysisStatus.INSUFFICIENT_DATA,
         10,
@@ -630,12 +644,12 @@ def test_fragment_sequence_and_report_serialization() -> None:
     assert result.to_dict()["validation_method"] == "held_out_recording"
     assert "activities" in result.to_dict()
     assert resolve_activity(sample("sleeping", 3.5), ()) is None
-    assert VacuumBranch(Activity.AWAY, 0.3).estimate(sample("cleaning", 0.3), None) == 0.3
+    assert FixedBranch(Activity.AWAY, 0.3).estimate(sample("cleaning", 0.3), None) == 0.3
 
 
 def test_activity_report_preserves_flat_json_contract() -> None:
     report = ActivityReport(
-        activity="washing",
+        activity=Activity.WASHING,
         sample_count=20,
         episode_count=2,
         validation_count=10,
@@ -682,8 +696,7 @@ def test_analysis_split_keeps_training_and_validation_separate(separate_recordin
 
 
 def test_charging_points_interpolate_between_named_coordinates() -> None:
-    branch = VacuumBranch(
-        Activity.CHARGING,
+    branch = ChargingBranch(
         calibration=[
             ChargingPoint(battery_level=20, power=40),
             ChargingPoint(battery_level=40, power=30),
@@ -734,7 +747,7 @@ def test_profile_without_charging_uses_only_activity_features() -> None:
 
     assert model.battery is None
     assert FeatureReference(BATTERY, FeatureSource.STATE) not in model.features
-    assert all(branch.power is not None for branch in model.branches)
+    assert all(isinstance(branch, FixedBranch) for branch in model.branches)
     assert model.estimate_power(sample("cleaning", 0)) == 0.3
     assert model.estimate_power(sample("washing", 0)) == 22
     fragment = model.build_model_config_fragment().to_dict()
@@ -820,7 +833,11 @@ def test_fixed_power_activities_are_validated_on_energy() -> None:
     data = repeated()
     split = split_vacuum_samples(data, CONTEXT)
     assert isinstance(split, TrainingValidationSplit)
-    model = VacuumCompositeStrategy().build_candidate(split.training, CONTEXT, split.signals, recording_samples=data)
+    candidates = VacuumCompositeStrategy().build_candidates(
+        split.training, CONTEXT, split.signals, recording_samples=data
+    )
+    assert not isinstance(candidates, StrategyNotApplicable)
+    [model] = candidates
     assert isinstance(model, VacuumCompositeCandidate)
     reports = build_activity_reports(model, data, split.validation)
     assert find_credibility_failure(reports) is None
@@ -846,7 +863,7 @@ def activity_report(
     has_fixed_power: bool = True,
 ) -> ActivityReport:
     return ActivityReport(
-        activity="drying" if has_fixed_power else "charging",
+        activity=Activity.DRYING if has_fixed_power else Activity.CHARGING,
         sample_count=100,
         episode_count=2,
         validation_count=50,
@@ -896,11 +913,10 @@ def test_identical_irregular_cycles_pass_energy_validation(tmp_path: Path, separ
         sample("drying", power, time) for power, time in zip([0, 0, 0, 0, 100, 0], [0, 1, 2, 3, 4, 24], strict=True)
     ]
     first.extend(sample("sleeping", 3.5, time) for time in range(25, 35))
-    first.extend(sample("washing", 100, time) for time in range(35, 45))
     if separate_recordings:
         paths = [write_recording(tmp_path / "first.jsonl", first), write_recording(tmp_path / "second.jsonl", first)]
     else:
-        second = [replace(item, elapsed_seconds=item.elapsed_seconds + 45) for item in first]
+        second = [replace(item, elapsed_seconds=item.elapsed_seconds + 35) for item in first]
         paths = [write_recording(tmp_path / "cycles.jsonl", first + second)]
     result = RecorderAnalyser().analyse(paths, CONTEXT)
     assert result.model_ready, result.reason
@@ -916,9 +932,11 @@ def test_training_does_not_bridge_excluded_samples() -> None:
     data.extend(sample("drying", 100, index) for index in range(10, 15))
     data.extend(sample("sleeping", 3.5, index) for index in range(15, 20))
     training = data[:5] + data[10:]
-    model = VacuumCompositeStrategy().build_candidate(
+    candidates = VacuumCompositeStrategy().build_candidates(
         training, CONTEXT, discover_signals(data, CONTEXT), recording_samples=data
     )
+    assert not isinstance(candidates, StrategyNotApplicable)
+    [model] = candidates
     assert isinstance(model, VacuumCompositeCandidate)
     drying = next(branch for branch in model.branches if branch.activity == Activity.DRYING)
     assert drying.power == 55
@@ -927,3 +945,63 @@ def test_training_does_not_bridge_excluded_samples() -> None:
 def test_time_weights_ignore_non_increasing_timestamps() -> None:
     data = [sample("drying", 10, time) for time in [1, 1, 0]]
     assert calculate_sample_durations(data, data) == {}
+
+
+@pytest.mark.parametrize("training_power, accepted", [(1.49, True), (1.51, False)])
+def test_short_activity_validation_uses_unrounded_energy(tmp_path: Path, training_power: float, accepted: bool) -> None:
+    paths = []
+    for index, power in enumerate([training_power, 1.0]):
+        data = [sample("sleeping", power, second) for second in range(5)]
+        data.extend(sample("washing", 100, second) for second in range(5, 10))
+        paths.append(write_recording(tmp_path / f"record-{index}.jsonl", data))
+
+    result = RecorderAnalyser().analyse(paths, CONTEXT)
+
+    assert result.model_ready is accepted, result.reason
+    sleeping = next(report for report in result.activity_reports if report.activity == "sleeping")
+    assert sleeping.energy.measured_wh == pytest.approx(4 / 3600)
+    assert sleeping.energy.predicted_wh == pytest.approx(training_power * 4 / 3600)
+    assert sleeping.energy.to_dict()["measured_energy_wh"] == 0.0011
+
+
+@pytest.mark.parametrize("levels", [[], [20], [20, 20], [40, 20]])
+def test_charging_curve_rejects_insufficient_or_unordered_points(levels: list[int]) -> None:
+    with pytest.raises(ValueError, match="calibration"):
+        ChargingBranch([ChargingPoint(level, 30) for level in levels])
+
+
+@pytest.mark.parametrize(
+    "header, expected_recipe, expected_primary",
+    [
+        ({}, None, None),
+        ({"recipe": 8, "primary_entity_id": []}, None, None),
+        ({"recipe": "future_recipe", "primary_entity_id": "vacuum.other"}, "future_recipe", "vacuum.other"),
+    ],
+)
+def test_partial_and_unknown_metadata_keeps_samples_readable(
+    tmp_path: Path, header: dict[str, object], expected_recipe: str | None, expected_primary: str | None
+) -> None:
+    path = write_recording(tmp_path / "record.jsonl", cycle(), None)
+    path.write_text(json.dumps({"record_type": "metadata", **header}) + "\n" + path.read_text(), encoding="utf-8")
+
+    loaded = load_recordings([path])
+
+    assert loaded.warnings == []
+    assert loaded.dataset.samples == cycle()
+    metadata = loaded.dataset.metadata
+    assert metadata is not None
+    assert metadata.recipe == expected_recipe
+    assert metadata.primary_entity_id == expected_primary
+    assert metadata.entities == []
+    assert restore_recording_context(CONTEXT, metadata) is CONTEXT
+
+
+def test_combining_recordings_preserves_unknown_recipe_identity(tmp_path: Path) -> None:
+    paths = []
+    for index, recipe in enumerate(["future_recipe", "another_recipe"]):
+        path = tmp_path / f"record-{index}.jsonl"
+        path.write_text(json.dumps({"record_type": "metadata", "recipe": recipe}), encoding="utf-8")
+        paths.append(path)
+
+    with pytest.raises(ValueError, match="same recipe"):
+        load_recordings(paths)

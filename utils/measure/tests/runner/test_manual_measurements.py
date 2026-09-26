@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 from measure.cancellation import MeasurementCancelledError
 from measure.powermeter.spec import DummyPowerMeterSpec
-from measure.recording.models import RecordedEntity, RecordingContext
+from measure.recording.models import RecordedEntity, RecorderProfileRecipe, RecordingContext
 from measure.request import AverageMeasurementRequest, RecorderMeasurementRequest
 from measure.runner.average import AverageRunner
 from measure.runner.interaction import RunInteraction
@@ -226,7 +226,7 @@ def test_vacuum_recorder_keeps_samples_when_optional_entities_disappear(
     )
     primary = RecordedEntity("vacuum.robot", "vacuum", "primary", integration="dreame_vacuum", translation_key="vacuum")
     context = RecordingContext(
-        "vacuum_robot",
+        RecorderProfileRecipe.VACUUM_ROBOT,
         "vacuum.robot",
         "vacuum_robot",
         [
