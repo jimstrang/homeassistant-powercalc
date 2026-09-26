@@ -17,12 +17,14 @@ from measure.analyser.models import (
     ValidationMethod,
 )
 from measure.analyser.recording import load_recordings, restore_recording_context
+from measure.analyser.sample_intervals import calculate_sample_durations
 from measure.analyser.service import RecorderAnalyser
 from measure.analyser.vacuum import (
     ChargingPoint,
     VacuumBranch,
     VacuumCompositeCandidate,
     VacuumCompositeStrategy,
+    calculate_average_power,
     get_battery_level,
     group_vacuum_episodes,
     split_vacuum_samples,
@@ -172,6 +174,8 @@ def test_insufficient_result_reports_belong_to_the_reason_it_states(tmp_path: Pa
             samples: list[RecordingSample],
             context: RecordingContext,
             signals: list[ActivitySignal],
+            *,
+            recording_samples: list[RecordingSample] | None = None,
         ) -> StrategyNotApplicable:
             return StrategyNotApplicable("never_applicable did not fit")
 
@@ -379,7 +383,7 @@ def test_short_mode_error_is_not_hidden_by_long_idle(tmp_path: Path) -> None:
     ]
     result = RecorderAnalyser().analyse(write_recording(tmp_path / "record.jsonl", data), CONTEXT)
     assert not result.model_ready
-    assert "washing validation error" in str(result.reason)
+    assert "washing validation predicts 22.00 W on average, but 100.00 W was measured" in str(result.reason)
     assert result.activity_reports
     assert result.validation_method is ValidationMethod.HELD_OUT_EPISODES
 
@@ -601,8 +605,10 @@ def test_metadata_validation_and_legacy_loading(tmp_path: Path) -> None:
                 },
             ],
             "device_entities": {},
+            "related_device_ids": ["dock", 5],
         },
     )
+    assert enriched.related_device_ids == ["dock"]
     assert enriched.entities[0].role == "primary"
     assert enriched.entities[0].device_id == "new"
     assert enriched.entities[0].unit is None
@@ -770,3 +776,154 @@ def test_missing_battery_before_a_later_branch_matches_export() -> None:
         )
         == 22
     )
+
+
+def test_fixed_branch_preserves_energy_of_a_cycling_load() -> None:
+    # A dryer heater cycling on and off: the median would report the heater-on level.
+    heater = iter([120, 120, 10] * 3 + [120])
+    data = [replace(item, power=next(heater)) if item.entities[STATE].state == "drying" else item for item in cycle()]
+
+    branches = {branch.activity: branch for branch in candidate(data).branches}
+
+    assert branches[Activity.DRYING].power == 83.33
+
+
+def test_average_power_weights_readings_by_the_time_they_represent() -> None:
+    held = sample("drying", 100, 0)
+    short_reading = replace(sample("drying", 10, 2), elapsed_seconds=2.0)
+    long_reading = replace(sample("drying", 40, 6), elapsed_seconds=6.0)
+    before_last = replace(sample("drying", 1000, 100), elapsed_seconds=100.0)
+    next_recording = replace(sample("drying", 1000, 0), recording_id=1)
+    data = [held, short_reading, long_reading, before_last, next_recording]
+
+    durations = calculate_sample_durations(data, data)
+
+    # Each endpoint gets half the interval, excluding long gaps and recording boundaries.
+    assert list(durations.values()) == [1.0, 3.0, 2.0]
+    assert calculate_average_power(data, durations) == 35.0
+    assert calculate_average_power([before_last, next_recording], durations) == 1000.0
+
+
+def test_held_out_recording_must_cover_a_meaningful_share_of_each_activity() -> None:
+    # The first recording charges ten times longer, leaving the second only about 9% of charging.
+    long_charge = [item for item in cycle() for _ in range(10 if item.entities[STATE].state == "charging" else 1)]
+    first = [replace(item, elapsed_seconds=float(index)) for index, item in enumerate(long_charge)]
+    second = [replace(item, recording_id=1) for item in cycle()]
+
+    split = split_vacuum_samples(first + second, CONTEXT)
+
+    assert isinstance(split, TrainingValidationSplit)
+    assert split.method is ValidationMethod.HELD_OUT_EPISODES
+
+
+def test_fixed_power_activities_are_validated_on_energy() -> None:
+    data = repeated()
+    split = split_vacuum_samples(data, CONTEXT)
+    assert isinstance(split, TrainingValidationSplit)
+    model = VacuumCompositeStrategy().build_candidate(split.training, CONTEXT, split.signals, recording_samples=data)
+    assert isinstance(model, VacuumCompositeCandidate)
+    reports = build_activity_reports(model, data, split.validation)
+    assert find_credibility_failure(reports) is None
+    for report in reports:
+        assert report.energy.duration_seconds > 0
+        assert report.energy.measured_wh > 0
+        assert report.energy.predicted_wh == pytest.approx(report.energy.measured_wh, abs=0.0001)
+    assert {report.activity for report in reports if report.has_fixed_power} == {
+        "sleeping",
+        "washing",
+        "auto_emptying",
+        "drying",
+        "away",
+    }
+
+
+def activity_report(
+    mae_w: float,
+    measured_wh: float,
+    predicted_wh: float,
+    duration_seconds: float = 3600,
+    coverage: float = 1,
+    has_fixed_power: bool = True,
+) -> ActivityReport:
+    return ActivityReport(
+        activity="drying" if has_fixed_power else "charging",
+        sample_count=100,
+        episode_count=2,
+        validation_count=50,
+        coverage=coverage,
+        mae_w=mae_w,
+        transition_mae_w=None,
+        mean_power_w=measured_wh,
+        energy=EnergyMetrics(duration_seconds, measured_wh, predicted_wh, None),
+        has_fixed_power=has_fixed_power,
+    )
+
+
+@pytest.mark.parametrize(
+    "report,expected",
+    [
+        # A cycling heater: large per-sample error, but the fixed power holds its energy.
+        (activity_report(mae_w=50, measured_wh=66, predicted_wh=62), None),
+        (activity_report(mae_w=5, measured_wh=88, predicted_wh=62), "predicts 62.00 W on average, but 88.00 W"),
+        # Below the absolute allowance, a large relative error is still negligible.
+        (activity_report(mae_w=0.3, measured_wh=0.6, predicted_wh=1.0), None),
+        (activity_report(mae_w=0, measured_wh=0, predicted_wh=0, duration_seconds=0), "no consecutive readings"),
+        (activity_report(mae_w=0, measured_wh=66, predicted_wh=66, coverage=0.5), "cannot reliably identify drying"),
+        (
+            activity_report(mae_w=0, measured_wh=30, predicted_wh=30, coverage=0.25, has_fixed_power=False),
+            "charging model covers only 25% of its validation samples",
+        ),
+        # A charging curve should follow each reading, so it keeps the per-sample check.
+        (
+            activity_report(mae_w=10, measured_wh=30, predicted_wh=30, has_fixed_power=False),
+            "charging validation error",
+        ),
+        (activity_report(mae_w=1, measured_wh=30, predicted_wh=20, has_fixed_power=False), None),
+    ],
+)
+def test_activity_validation(report: ActivityReport, expected: str | None) -> None:
+    failure = find_credibility_failure([report])
+    if expected is None:
+        assert failure is None
+    else:
+        assert failure is not None
+        assert expected in failure
+
+
+@pytest.mark.parametrize("separate_recordings", [False, True])
+def test_identical_irregular_cycles_pass_energy_validation(tmp_path: Path, separate_recordings: bool) -> None:
+    first = [
+        sample("drying", power, time) for power, time in zip([0, 0, 0, 0, 100, 0], [0, 1, 2, 3, 4, 24], strict=True)
+    ]
+    first.extend(sample("sleeping", 3.5, time) for time in range(25, 35))
+    first.extend(sample("washing", 100, time) for time in range(35, 45))
+    if separate_recordings:
+        paths = [write_recording(tmp_path / "first.jsonl", first), write_recording(tmp_path / "second.jsonl", first)]
+    else:
+        second = [replace(item, elapsed_seconds=item.elapsed_seconds + 45) for item in first]
+        paths = [write_recording(tmp_path / "cycles.jsonl", first + second)]
+    result = RecorderAnalyser().analyse(paths, CONTEXT)
+    assert result.model_ready, result.reason
+    drying = next(report for report in result.activity_reports if report.activity == "drying")
+    assert drying.energy.duration_seconds == 24
+    assert drying.energy.measured_wh == pytest.approx(1050 / 3600, abs=0.0001)
+    assert drying.energy.predicted_wh == drying.energy.measured_wh
+
+
+def test_training_does_not_bridge_excluded_samples() -> None:
+    data = [sample("drying", 10, index) for index in range(5)]
+    data.extend(sample("sleeping", 3.5, index) for index in range(5, 10))
+    data.extend(sample("drying", 100, index) for index in range(10, 15))
+    data.extend(sample("sleeping", 3.5, index) for index in range(15, 20))
+    training = data[:5] + data[10:]
+    model = VacuumCompositeStrategy().build_candidate(
+        training, CONTEXT, discover_signals(data, CONTEXT), recording_samples=data
+    )
+    assert isinstance(model, VacuumCompositeCandidate)
+    drying = next(branch for branch in model.branches if branch.activity == Activity.DRYING)
+    assert drying.power == 55
+
+
+def test_time_weights_ignore_non_increasing_timestamps() -> None:
+    data = [sample("drying", 10, time) for time in [1, 1, 0]]
+    assert calculate_sample_durations(data, data) == {}

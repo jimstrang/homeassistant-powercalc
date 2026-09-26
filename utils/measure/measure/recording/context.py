@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from measure.recording.models import EntityRole, RecordedEntity, RecordingContext
@@ -11,8 +11,13 @@ if TYPE_CHECKING:
 def build_recording_context(
     request: RecorderMeasurementRequest,
     descriptors: Sequence[EntityDescriptor] = (),
+    related_device_ids: Mapping[str, list[str]] | None = None,
 ) -> RecordingContext:
-    """Build the recording header from selected entities and optional registry metadata."""
+    """Build the recording header from selected entities and optional registry metadata.
+
+    The device inventory covers the primary device and its related devices (see
+    map_profile_related_devices), so the analyser can check placeholder uniqueness.
+    """
     entity_ids = request.recorded_entity_ids
     if not entity_ids or request.profile_recipe is None:
         raise ValueError("A complex-profile recorder request is required for recording metadata")
@@ -23,12 +28,17 @@ def build_recording_context(
     by_id = {entity.entity_id: entity for entity in descriptors}
 
     primary = by_id.get(entity_ids[0])
+    related: list[str] = []
+    inventory_device_ids: set[str] = set()
+    if primary is not None and primary.device_id is not None:
+        related = list((related_device_ids or {}).get(primary.device_id, []))
+        inventory_device_ids = {primary.device_id, *related}
     device_entities = [
         _build_recorded_entity(
             entity.entity_id, EntityRole.AVAILABLE if entity.disabled_by is None else EntityRole.DISABLED, entity
         )
         for entity in descriptors
-        if primary is not None and primary.device_id is not None and entity.device_id == primary.device_id
+        if entity.device_id in inventory_device_ids
     ]
     return RecordingContext(
         recipe=request.profile_recipe.value,
@@ -38,6 +48,7 @@ def build_recording_context(
             _build_recorded_entity(entity_id, roles[entity_id], by_id.get(entity_id)) for entity_id in entity_ids
         ],
         device_entities=device_entities,
+        related_device_ids=related,
     )
 
 

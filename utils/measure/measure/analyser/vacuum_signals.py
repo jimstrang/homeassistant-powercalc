@@ -1,6 +1,6 @@
 """Map recorded runtime signals to canonical vacuum activities."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 import json
@@ -106,12 +106,13 @@ class _SourcePriority(IntEnum):
     """Prefer dedicated action signals, then the most detailed status source."""
 
     ACTION_ENTITY = 0
-    ACTIVITY_FLAG = 1
-    RELATED_STATE = 2
-    RELATED_STATUS = 3
-    VACUUM_STATE_ATTRIBUTE = 4
-    STATUS_ATTRIBUTE = 5
-    HA_STATE = 6
+    DEPRECATED_ACTION_ENTITY = 1
+    ACTIVITY_FLAG = 2
+    RELATED_STATE = 3
+    RELATED_STATUS = 4
+    VACUUM_STATE_ATTRIBUTE = 5
+    STATUS_ATTRIBUTE = 6
+    HA_STATE = 7
 
 
 _ATTRIBUTE_FLAGS = {"washing": Activity.WASHING, "drying": Activity.DRYING, "auto_empty_status": Activity.AUTO_EMPTYING}
@@ -130,6 +131,9 @@ _ACTION_ENTITY_KEYS = {
     "mop_drying_status": Activity.DRYING,
     "dust_emptying": Activity.AUTO_EMPTYING,
 }
+# Home Assistant's Roborock integration deprecated this binary sensor in favour of the
+# mop_drying switch, so a profile should only fall back to it.
+_DEPRECATED_ACTION_ENTITY_KEYS = {"mop_drying_status"}
 _STATION_KEYS = {"station_state", "self_wash_base_status"}
 _STATION_ACTIVITIES = (Activity.AUTO_EMPTYING, Activity.STATION_CLEANING, Activity.WASHING, Activity.DRYING)
 _CHARGING_ACTIVITIES = (Activity.CHARGING, Activity.COMPLETED)
@@ -187,25 +191,52 @@ class _SignalCandidate:
 def resolve_portable_entity(entity_id: str, context: RecordingContext) -> str | None:
     """Map a recorded entity ID to a profile placeholder reusable in other HA installations.
 
-    Use [[entity]] for the vacuum, otherwise a unique translation key or supported
-    battery device class on the same device. Return None when no safe mapping exists.
+    Use [[entity]] for the vacuum, otherwise a translation key or supported battery
+    device class that PowerCalc resolves to exactly this entity. Return None when no
+    safe mapping exists.
     """
     if entity_id == context.primary_entity_id:
         return "[[entity]]"
     entity = next((entity for entity in context.entities if entity.entity_id == entity_id), None)
     primary = next((entity for entity in context.entities if entity.entity_id == context.primary_entity_id), None)
-    if entity is None or primary is None or not primary.device_id or entity.device_id != primary.device_id:
+    if entity is None or primary is None or not primary.device_id or not entity.device_id:
         return None
     inventory = context.device_entities or context.entities
-    related = [item for item in inventory if item.device_id == entity.device_id]
-    if entity.translation_key and sum(item.translation_key == entity.translation_key for item in related) == 1:
-        return f"[[entity_by_translation_key:{entity.translation_key}]]"
-    if (
-        (entity.domain == "sensor" and entity.device_class == "battery" and entity.unit == "%")
-        or (entity.domain == "binary_sensor" and entity.device_class == "battery_charging")
-    ) and sum(item.device_class == entity.device_class for item in related) == 1:
-        return f"[[entity_by_device_class:{entity.device_class}]]"
+    source_entities = [item for item in inventory if item.device_id == primary.device_id]
+    if entity.device_id == primary.device_id:
+        candidates: list[RecordedEntity] = source_entities
+        shadowing: list[RecordedEntity] = []
+    elif entity.device_id in context.related_device_ids:
+        # PowerCalc only searches related devices, such as a dock, when the vacuum's
+        # own device has no match, and then requires one match across all of them.
+        candidates = [item for item in inventory if item.device_id in context.related_device_ids]
+        shadowing = source_entities
+    else:
+        return None
+
+    key = entity.translation_key
+    if key and _is_unique_match(candidates, shadowing, lambda item: item.translation_key == key):
+        return f"[[entity_by_translation_key:{key}]]"
+    device_class = entity.device_class
+    if _has_portable_device_class(entity) and _is_unique_match(
+        candidates, shadowing, lambda item: item.device_class == device_class
+    ):
+        return f"[[entity_by_device_class:{device_class}]]"
     return None
+
+
+def _is_unique_match(
+    candidates: Sequence[RecordedEntity],
+    shadowing: Sequence[RecordedEntity],
+    matches: Callable[[RecordedEntity], bool],
+) -> bool:
+    return not any(matches(item) for item in shadowing) and sum(matches(item) for item in candidates) == 1
+
+
+def _has_portable_device_class(entity: RecordedEntity) -> bool:
+    return (entity.domain == "sensor" and entity.device_class == "battery" and entity.unit == "%") or (
+        entity.domain == "binary_sensor" and entity.device_class == "battery_charging"
+    )
 
 
 def _discover_entity_signals(
@@ -218,7 +249,12 @@ def _discover_entity_signals(
         feature = FeatureReference(entity.entity_id, FeatureSource.STATE)
         key = entity.translation_key
         if entity.domain in {"binary_sensor", "switch"} and key in _ACTION_ENTITY_KEYS:
-            _add_flags(candidates, samples, feature, _ACTION_ENTITY_KEYS[str(key)], _SourcePriority.ACTION_ENTITY)
+            priority = (
+                _SourcePriority.DEPRECATED_ACTION_ENTITY
+                if key in _DEPRECATED_ACTION_ENTITY_KEYS
+                else _SourcePriority.ACTION_ENTITY
+            )
+            _add_flags(candidates, samples, feature, _ACTION_ENTITY_KEYS[str(key)], priority)
         elif entity.domain == "sensor" and entity.translation_key == "auto_empty_status":
             _add_flags(candidates, samples, feature, Activity.AUTO_EMPTYING, _SourcePriority.ACTION_ENTITY)
         elif entity.domain == "sensor" and entity.translation_key in _STATION_KEYS:

@@ -102,7 +102,12 @@ def restore_recording_context(fallback: RecordingContext, metadata: Mapping[str,
         device_type=fallback.device_type,
         entities=selected,
         device_entities=_parse_metadata_entities(metadata.get("device_entities")),
+        related_device_ids=_parse_strings(metadata.get("related_device_ids")),
     )
+
+
+def _parse_strings(value: object) -> list[str]:
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
 
 
 def _parse_metadata_entities(value: object) -> list[RecordedEntity]:

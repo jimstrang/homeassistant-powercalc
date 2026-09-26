@@ -70,6 +70,8 @@ class RecordingContext:
     device_type: str
     entities: list[RecordedEntity]
     device_entities: list[RecordedEntity] = field(default_factory=list)
+    #: Devices besides the primary's whose entities PowerCalc profiles can reference, such as a vacuum dock.
+    related_device_ids: list[str] = field(default_factory=list)
 
     def build_metadata_record(self) -> dict[str, object]:
         record: dict[str, object] = {
@@ -81,6 +83,8 @@ class RecordingContext:
         }
         if self.device_entities:
             record["device_entities"] = [entity.to_dict() for entity in self.device_entities]
+        if self.related_device_ids:
+            record["related_device_ids"] = list(self.related_device_ids)
         return record
 
 

@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from enum import StrEnum
 import math
 from typing import TYPE_CHECKING, Any
@@ -18,6 +19,7 @@ from measure.home_assistant.const import (
     HASS_ENTITY_GROUP_MEMBERS,
     HASS_ENTITY_UNIT_OF_MEASUREMENT,
 )
+from measure.home_assistant.device_relations import map_profile_related_devices
 
 if TYPE_CHECKING:
     from homeassistant_api import EntityRegistryEntry
@@ -83,9 +85,20 @@ class EntityDescriptor(BaseModel):
 class EntityCatalogSnapshot:
     """Immutable view used for one selector or preflight operation."""
 
-    def __init__(self, entities: list[EntityDescriptor]) -> None:
+    def __init__(
+        self,
+        entities: list[EntityDescriptor],
+        related_device_ids: Mapping[str, list[str]] | None = None,
+    ) -> None:
         self._entities = tuple(entities)
         self._by_id = {entity.entity_id: entity for entity in entities}
+        self._related_device_ids = dict(related_device_ids or {})
+
+    @property
+    def related_device_ids(self) -> Mapping[str, list[str]]:
+        """Devices whose entities PowerCalc profiles may reference, keyed by source device ID."""
+
+        return self._related_device_ids
 
     def select(
         self,
@@ -211,7 +224,10 @@ class HomeAssistantEntityCatalog:
             if entity_id not in live_ids
         )
         by_id = {descriptor.entity_id: descriptor for descriptor in descriptors}
-        return EntityCatalogSnapshot([_enrich_group_device_metadata(descriptor, by_id) for descriptor in descriptors])
+        return EntityCatalogSnapshot(
+            [_enrich_group_device_metadata(descriptor, by_id) for descriptor in descriptors],
+            map_profile_related_devices(data.device_registry),
+        )
 
 
 def _describe_registry_entity(entry: EntityRegistryEntry, devices: dict[str, dict[str, object]]) -> EntityDescriptor:

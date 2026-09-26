@@ -99,3 +99,62 @@ def test_recording_context_maps_generic_and_vacuum_recipes() -> None:
     playbook = RecorderMeasurementRequest(power_meter=DummyPowerMeterSpec())
     with pytest.raises(ValueError, match="complex-profile"):
         build_recording_context(playbook)
+
+
+def test_vacuum_context_inventories_related_dock_devices() -> None:
+    request = RecorderMeasurementRequest(
+        power_meter=DummyPowerMeterSpec(),
+        recorder_purpose="complex_profile",
+        profile_recipe="vacuum_robot",
+        vacuum_entity_id="vacuum.robot",
+        battery_entity_id="sensor.battery",
+        additional_entity_ids=("switch.dock_mop_drying",),
+    )
+    descriptors = [
+        EntityDescriptor(
+            entity_id="vacuum.robot",
+            name="Robot",
+            domain="vacuum",
+            device_id="robot",
+            state="docked",
+            attribute_names=[],
+        ),
+        EntityDescriptor(
+            entity_id="switch.dock_mop_drying",
+            name="Drying",
+            domain="switch",
+            device_id="dock",
+            state="off",
+            attribute_names=[],
+            translation_key="mop_drying",
+        ),
+        EntityDescriptor(
+            entity_id="switch.dock_child_lock",
+            name="Child lock",
+            domain="switch",
+            device_id="dock",
+            state="off",
+            attribute_names=[],
+            translation_key="child_lock",
+        ),
+        EntityDescriptor(
+            entity_id="sensor.unrelated",
+            name="Other",
+            domain="sensor",
+            device_id="other",
+            state="idle",
+            attribute_names=[],
+        ),
+    ]
+
+    context = build_recording_context(request, descriptors, {"robot": ["dock"], "other": ["robot"]})
+
+    assert context.related_device_ids == ["dock"]
+    record = context.build_metadata_record()
+    assert record["related_device_ids"] == ["dock"]
+    assert [entity["entity_id"] for entity in record["device_entities"]] == [
+        "vacuum.robot",
+        "switch.dock_mop_drying",
+        "switch.dock_child_lock",
+    ]
+    assert "related_device_ids" not in build_recording_context(request, descriptors).build_metadata_record()

@@ -178,12 +178,77 @@ def test_runtime_flags_not_settings(
     assert [resolve_activity(item, signals) for item in items] == expected
 
 
-def test_separate_device_remains_outside_mvp() -> None:
+def test_unrelated_device_is_not_portable() -> None:
     descriptor = replace(entity("mop_drying", "switch", "roborock"), device_id="dock")
     ctx = context(descriptor)
     assert resolve_portable_entity(descriptor.entity_id, ctx) is None
     item = sample(**{descriptor.entity_id: "on"})
     assert resolve_activity(item, discover_signals([item], ctx)) == "docked"
+
+
+def test_related_dock_entity_is_a_portable_activity_signal() -> None:
+    drying = replace(entity("mop_drying", "switch", "roborock"), device_id="dock")
+    ctx = replace(context(drying), related_device_ids=["dock"])
+    assert resolve_portable_entity(drying.entity_id, ctx) == "[[entity_by_translation_key:mop_drying]]"
+
+    items = [sample(**{drying.entity_id: value}) for value in ("on", "off")]
+    signals = discover_signals(items, ctx)
+    assert [resolve_activity(item, signals) for item in items] == ["drying", "docked"]
+    assert signals[0].build_condition(ctx) == {
+        "condition": "state",
+        "entity_id": "[[entity_by_translation_key:mop_drying]]",
+        "state": ["on"],
+    }
+
+
+def test_drying_switch_wins_over_deprecated_drying_status() -> None:
+    switch = replace(entity("mop_drying", "switch", "roborock"), device_id="dock")
+    status = replace(entity("mop_drying_status", "binary_sensor", "roborock"), device_id="dock")
+    ctx = replace(context(switch, status), related_device_ids=["dock"])
+    # A stale deprecated sensor must not decide drying while the switch is available.
+    items = [
+        sample(**{switch.entity_id: "on", status.entity_id: "off"}),
+        sample(**{switch.entity_id: "off", status.entity_id: "on"}),
+    ]
+
+    signals = discover_signals(items, ctx)
+
+    assert [signal.feature.entity_id for signal in signals if signal.activity == "drying"] == [switch.entity_id]
+    assert [resolve_activity(item, signals) for item in items] == ["drying", "docked"]
+
+
+def test_deprecated_drying_status_is_used_without_the_switch() -> None:
+    status = replace(entity("mop_drying_status", "binary_sensor", "roborock"), device_id="dock")
+    ctx = replace(context(status), related_device_ids=["dock"])
+    items = [sample(**{status.entity_id: value}) for value in ("on", "off")]
+
+    signals = discover_signals(items, ctx)
+
+    assert [resolve_activity(item, signals) for item in items] == ["drying", "docked"]
+
+
+@pytest.mark.parametrize(
+    "other_device_id",
+    [
+        # PowerCalc resolves the key to the vacuum's own entity first.
+        "robot",
+        # PowerCalc refuses a key that matches on more than one related device.
+        "second_dock",
+    ],
+)
+def test_related_entity_needs_a_placeholder_resolving_to_it(other_device_id: str) -> None:
+    drying = replace(entity("mop_drying", "switch", "roborock"), device_id="dock")
+    other = replace(drying, entity_id="switch.other_mop_drying", device_id=other_device_id)
+    ctx = replace(context(drying, other), related_device_ids=["dock", "second_dock"])
+    assert resolve_portable_entity(drying.entity_id, ctx) is None
+
+
+def test_related_battery_uses_device_class_when_the_vacuum_has_none() -> None:
+    battery = RecordedEntity(
+        "sensor.dock_battery", "sensor", "battery", device_class="battery", unit="%", device_id="dock"
+    )
+    ctx = replace(context(battery), related_device_ids=["dock"])
+    assert resolve_portable_entity(battery.entity_id, ctx) == "[[entity_by_device_class:battery]]"
 
 
 def test_disabled_sleep_status_is_ignored() -> None:
