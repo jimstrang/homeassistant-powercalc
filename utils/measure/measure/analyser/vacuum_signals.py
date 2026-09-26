@@ -106,12 +106,13 @@ class _SourcePriority(IntEnum):
     """Prefer dedicated action signals, then the most detailed status source."""
 
     ACTION_ENTITY = 0
-    ACTIVITY_FLAG = 1
-    RELATED_STATE = 2
-    RELATED_STATUS = 3
-    VACUUM_STATE_ATTRIBUTE = 4
-    STATUS_ATTRIBUTE = 5
-    HA_STATE = 6
+    DEPRECATED_ACTION_ENTITY = 1
+    ACTIVITY_FLAG = 2
+    RELATED_STATE = 3
+    RELATED_STATUS = 4
+    VACUUM_STATE_ATTRIBUTE = 5
+    STATUS_ATTRIBUTE = 6
+    HA_STATE = 7
 
 
 _ATTRIBUTE_FLAGS = {"washing": Activity.WASHING, "drying": Activity.DRYING, "auto_empty_status": Activity.AUTO_EMPTYING}
@@ -130,6 +131,9 @@ _ACTION_ENTITY_KEYS = {
     "mop_drying_status": Activity.DRYING,
     "dust_emptying": Activity.AUTO_EMPTYING,
 }
+# Home Assistant's Roborock integration deprecated this binary sensor in favour of the
+# mop_drying switch, so a profile should only fall back to it.
+_DEPRECATED_ACTION_ENTITY_KEYS = {"mop_drying_status"}
 _STATION_KEYS = {"station_state", "self_wash_base_status"}
 _STATION_ACTIVITIES = (Activity.AUTO_EMPTYING, Activity.STATION_CLEANING, Activity.WASHING, Activity.DRYING)
 _CHARGING_ACTIVITIES = (Activity.CHARGING, Activity.COMPLETED)
@@ -245,7 +249,12 @@ def _discover_entity_signals(
         feature = FeatureReference(entity.entity_id, FeatureSource.STATE)
         key = entity.translation_key
         if entity.domain in {"binary_sensor", "switch"} and key in _ACTION_ENTITY_KEYS:
-            _add_flags(candidates, samples, feature, _ACTION_ENTITY_KEYS[str(key)], _SourcePriority.ACTION_ENTITY)
+            priority = (
+                _SourcePriority.DEPRECATED_ACTION_ENTITY
+                if key in _DEPRECATED_ACTION_ENTITY_KEYS
+                else _SourcePriority.ACTION_ENTITY
+            )
+            _add_flags(candidates, samples, feature, _ACTION_ENTITY_KEYS[str(key)], priority)
         elif entity.domain == "sensor" and entity.translation_key == "auto_empty_status":
             _add_flags(candidates, samples, feature, Activity.AUTO_EMPTYING, _SourcePriority.ACTION_ENTITY)
         elif entity.domain == "sensor" and entity.translation_key in _STATION_KEYS:

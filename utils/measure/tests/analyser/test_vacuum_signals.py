@@ -201,6 +201,32 @@ def test_related_dock_entity_is_a_portable_activity_signal() -> None:
     }
 
 
+def test_drying_switch_wins_over_deprecated_drying_status() -> None:
+    switch = replace(entity("mop_drying", "switch", "roborock"), device_id="dock")
+    status = replace(entity("mop_drying_status", "binary_sensor", "roborock"), device_id="dock")
+    ctx = replace(context(switch, status), related_device_ids=["dock"])
+    # A stale deprecated sensor must not decide drying while the switch is available.
+    items = [
+        sample(**{switch.entity_id: "on", status.entity_id: "off"}),
+        sample(**{switch.entity_id: "off", status.entity_id: "on"}),
+    ]
+
+    signals = discover_signals(items, ctx)
+
+    assert [signal.feature.entity_id for signal in signals if signal.activity == "drying"] == [switch.entity_id]
+    assert [resolve_activity(item, signals) for item in items] == ["drying", "docked"]
+
+
+def test_deprecated_drying_status_is_used_without_the_switch() -> None:
+    status = replace(entity("mop_drying_status", "binary_sensor", "roborock"), device_id="dock")
+    ctx = replace(context(status), related_device_ids=["dock"])
+    items = [sample(**{status.entity_id: value}) for value in ("on", "off")]
+
+    signals = discover_signals(items, ctx)
+
+    assert [resolve_activity(item, signals) for item in items] == ["drying", "docked"]
+
+
 @pytest.mark.parametrize(
     "other_device_id",
     [
