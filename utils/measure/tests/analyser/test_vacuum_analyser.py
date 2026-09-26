@@ -23,6 +23,8 @@ from measure.analyser.vacuum import (
     VacuumBranch,
     VacuumCompositeCandidate,
     VacuumCompositeStrategy,
+    calculate_average_power,
+    calculate_sample_durations,
     get_battery_level,
     group_vacuum_episodes,
     split_vacuum_samples,
@@ -772,3 +774,29 @@ def test_missing_battery_before_a_later_branch_matches_export() -> None:
         )
         == 22
     )
+
+
+def test_fixed_branch_preserves_energy_of_a_cycling_load() -> None:
+    # A dryer heater cycling on and off: the median would report the heater-on level.
+    heater = iter([120, 120, 10] * 3 + [120])
+    data = [replace(item, power=next(heater)) if item.entities[STATE].state == "drying" else item for item in cycle()]
+
+    branches = {branch.activity: branch for branch in candidate(data).branches}
+
+    assert branches[Activity.DRYING].power == 87.0
+
+
+def test_average_power_weights_readings_by_the_time_they_represent() -> None:
+    held = sample("drying", 100, 0)
+    short_reading = replace(sample("drying", 10, 2), elapsed_seconds=2.0)
+    long_reading = replace(sample("drying", 40, 6), elapsed_seconds=6.0)
+    before_last = replace(sample("drying", 1000, 100), elapsed_seconds=100.0)
+    next_recording = replace(sample("drying", 1000, 0), recording_id=1)
+    data = [held, short_reading, long_reading, before_last, next_recording]
+
+    durations = calculate_sample_durations(data)
+
+    # A reading holds until the next one, but not across a long gap or into another recording.
+    assert list(durations.values()) == [2.0, 4.0]
+    assert calculate_average_power(data, durations) == 40.0
+    assert calculate_average_power([before_last, next_recording], durations) == 1000.0

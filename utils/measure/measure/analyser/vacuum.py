@@ -2,11 +2,11 @@
 
 from bisect import bisect_right
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import pairwise
 import math
-from statistics import median
+from statistics import mean, median
 
 from measure.analyser.models import (
     FeatureReference,
@@ -33,6 +33,8 @@ MIN_CHARGING_SPAN = 20
 CHARGING_BIN_WIDTH = 5
 MIN_CHARGING_BINS = 3
 MIN_SAMPLES_PER_CHARGING_BIN = 3
+#: Longer gaps between readings leave the power in between unknown.
+MAX_SAMPLE_INTERVAL_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -171,11 +173,12 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
         if any(sample.power < 0 for sample in samples):
             return StrategyNotApplicable("Vacuum power must be non-negative; check the meter or dummy-load correction")
         battery = find_battery_feature(grouped[Activity.CHARGING], context) if Activity.CHARGING in grouped else None
+        durations = calculate_sample_durations(samples)
         branches: list[VacuumBranch] = []
         for signal in signals:
             if not (activity_samples := grouped.get(signal.activity)):
                 continue
-            branch = _fit_branch(signal.activity, activity_samples, battery)
+            branch = _fit_branch(signal.activity, activity_samples, battery, durations)
             if isinstance(branch, StrategyNotApplicable):
                 return branch
             branches.append(branch)
@@ -183,13 +186,39 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
 
 
 def _fit_branch(
-    activity: Activity, samples: Sequence[RecordingSample], battery: FeatureReference | None
+    activity: Activity,
+    samples: Sequence[RecordingSample],
+    battery: FeatureReference | None,
+    durations: Mapping[int, float],
 ) -> VacuumBranch | StrategyNotApplicable:
     if len(samples) < MIN_EPISODE_SAMPLES:
         return StrategyNotApplicable(f"Record at least {MIN_EPISODE_SAMPLES} training samples for {activity}")
     if activity == Activity.CHARGING:
         return _fit_charging_branch(samples, battery)
-    return VacuumBranch(activity, round(median(sample.power for sample in samples), 2))
+    # A fixed power must preserve energy: a median would pick the heater-on level of
+    # a cycling dryer, or ignore the start-up ramp of a short bin emptying.
+    return VacuumBranch(activity, round(calculate_average_power(samples, durations), 2))
+
+
+def calculate_sample_durations(samples: Sequence[RecordingSample]) -> dict[int, float]:
+    """Seconds each reading represents, keyed by id(sample): until the next reading of its recording.
+
+    Readings before a longer gap, or at the end of a recording, represent no time.
+    """
+    durations: dict[int, float] = {}
+    for current, following in pairwise(samples):
+        delta = following.elapsed_seconds - current.elapsed_seconds
+        if current.recording_id == following.recording_id and 0 < delta <= MAX_SAMPLE_INTERVAL_SECONDS:
+            durations[id(current)] = delta
+    return durations
+
+
+def calculate_average_power(samples: Sequence[RecordingSample], durations: Mapping[int, float]) -> float:
+    """Time-weighted mean power; the plain mean when no reading represents any time."""
+    total_duration = sum(durations.get(id(sample), 0.0) for sample in samples)
+    if total_duration == 0:
+        return mean(sample.power for sample in samples)
+    return sum(sample.power * durations.get(id(sample), 0.0) for sample in samples) / total_duration
 
 
 def get_battery_level(sample: RecordingSample, feature: FeatureReference | None) -> int | None:

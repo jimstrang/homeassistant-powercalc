@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from itertools import pairwise
 
 from measure.analyser.models import UNEXPLAINED_ACTIVITY, ActivityReport, EnergyMetrics
-from measure.analyser.vacuum import VacuumCompositeCandidate, group_vacuum_episodes
+from measure.analyser.vacuum import MAX_SAMPLE_INTERVAL_SECONDS, VacuumCompositeCandidate, group_vacuum_episodes
 from measure.recording.models import RecordingSample
 
 MAX_RELATIVE_ACTIVITY_MAE = 0.2
@@ -91,7 +91,7 @@ def _calculate_energy_metrics(
             continue
         delta = right.elapsed_seconds - left.elapsed_seconds
         first, second = candidate.estimate_power(left), candidate.estimate_power(right)
-        if not 0 < delta <= 30 or first is None or second is None:
+        if not 0 < delta <= MAX_SAMPLE_INTERVAL_SECONDS or first is None or second is None:
             continue
         duration += delta
         measured += (left.power + right.power) / 2 * delta / 3600
