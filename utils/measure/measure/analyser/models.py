@@ -121,6 +121,8 @@ class StrategyNotApplicable:
 
 
 class ProfileAnalysisStrategy(Protocol):
+    """Fit training samples, optionally using the full recording to preserve interval boundaries."""
+
     @property
     def strategy_id(self) -> str: ...
 
@@ -129,6 +131,8 @@ class ProfileAnalysisStrategy(Protocol):
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],
+        *,
+        recording_samples: Sequence[RecordingSample] | None = None,
     ) -> AnalysisCandidate | StrategyNotApplicable: ...
 
 

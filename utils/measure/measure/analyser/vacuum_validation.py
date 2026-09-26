@@ -67,27 +67,32 @@ def find_credibility_failure(reports: Sequence[ActivityReport]) -> str | None:
                 f"{report.sample_count} of {total} samples match no known activity; "
                 "record its runtime entities and repeat that cycle"
             )
-        if report.coverage < 0.9 and not report.has_fixed_power:
-            # A charging curve cannot estimate battery levels its training charges never reached.
-            return (
-                f"The {activity} model covers only {report.coverage:.0%} of its validation samples; "
-                f"record at least two {activity} cycles over the same battery range"
-            )
-        if report.coverage < 0.9:
-            return (
-                f"The vacuum profile cannot reliably identify {activity}; "
-                "record its runtime entities and repeat that cycle"
-            )
-        if report.has_fixed_power:
-            if (failure := _find_energy_failure(report)) is not None:
-                return failure
-            continue
-        allowance = max(MIN_ACTIVITY_ERROR_ALLOWANCE_W, MAX_RELATIVE_ACTIVITY_ERROR * report.mean_power_w)
-        if report.mae_w is None or report.mae_w > allowance:
-            return (
-                f"The {activity} validation error exceeds {allowance:.2f} W; record repeated, complete {activity} "
-                "cycles and the entities that report this activity"
-            )
+        if (failure := _find_activity_failure(report)) is not None:
+            return failure
+    return None
+
+
+def _find_activity_failure(report: ActivityReport) -> str | None:
+    """Check coverage and the appropriate error metric for one identified activity."""
+    activity = report.activity
+    if report.coverage < 0.9 and not report.has_fixed_power:
+        # A charging curve cannot estimate battery levels its training charges never reached.
+        return (
+            f"The {activity} model covers only {report.coverage:.0%} of its validation samples; "
+            f"record at least two {activity} cycles over the same battery range"
+        )
+    if report.coverage < 0.9:
+        return (
+            f"The vacuum profile cannot reliably identify {activity}; record its runtime entities and repeat that cycle"
+        )
+    if report.has_fixed_power:
+        return _find_energy_failure(report)
+    allowance = max(MIN_ACTIVITY_ERROR_ALLOWANCE_W, MAX_RELATIVE_ACTIVITY_ERROR * report.mean_power_w)
+    if report.mae_w is None or report.mae_w > allowance:
+        return (
+            f"The {activity} validation error exceeds {allowance:.2f} W; record repeated, complete {activity} "
+            "cycles and the entities that report this activity"
+        )
     return None
 
 

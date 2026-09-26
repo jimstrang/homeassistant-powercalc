@@ -174,6 +174,8 @@ def test_insufficient_result_reports_belong_to_the_reason_it_states(tmp_path: Pa
             samples: list[RecordingSample],
             context: RecordingContext,
             signals: list[ActivitySignal],
+            *,
+            recording_samples: list[RecordingSample] | None = None,
         ) -> StrategyNotApplicable:
             return StrategyNotApplicable("never_applicable did not fit")
 

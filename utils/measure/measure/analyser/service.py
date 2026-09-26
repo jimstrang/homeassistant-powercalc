@@ -59,11 +59,7 @@ class RecorderAnalyser:
         # never explains one strategy's rejection with another strategy's activities.
         failures: list[tuple[str, list[ActivityReport]]] = []
         for strategy in self._select_strategies(context):
-            candidate = (
-                strategy.build_candidate(split.training, context, split.signals, recording_samples=samples)
-                if isinstance(strategy, VacuumCompositeStrategy)
-                else strategy.build_candidate(split.training, context, split.signals)
-            )
+            candidate = strategy.build_candidate(split.training, context, split.signals, recording_samples=samples)
             if isinstance(candidate, StrategyNotApplicable):
                 failures.append((candidate.reason, []))
                 _LOGGER.debug("Analyser strategy %s was not applicable: %s", strategy.strategy_id, candidate.reason)

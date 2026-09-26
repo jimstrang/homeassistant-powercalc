@@ -72,6 +72,8 @@ class FixedStatesPowerStrategy(ProfileAnalysisStrategy):
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],  # Unused: a fixed profile resolves no vacuum activities.
+        *,
+        recording_samples: Sequence[RecordingSample] | None = None,
     ) -> AnalysisCandidate | StrategyNotApplicable:
         candidates = [
             candidate
