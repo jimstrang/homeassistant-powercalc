@@ -35,6 +35,9 @@ MIN_CHARGING_BINS = 3
 MIN_SAMPLES_PER_CHARGING_BIN = 3
 #: Longer gaps between readings leave the power in between unknown.
 MAX_SAMPLE_INTERVAL_SECONDS = 30
+#: A held-out recording must cover this share of every activity's recorded time, so
+#: a few seconds of an activity cannot decide whether its model is credible.
+MIN_HELD_OUT_SHARE = 0.1
 
 
 @dataclass(frozen=True)
@@ -346,11 +349,8 @@ def split_vacuum_samples(
         held_out = recordings[-1]
         training = [sample for sample in samples if sample.recording_id != held_out]
         validation = [sample for sample in samples if sample.recording_id == held_out]
-        if all(
-            any(episode.samples[0].recording_id == held_out for episode in items)
-            and any(episode.samples[0].recording_id != held_out for episode in items)
-            for items in grouped.values()
-        ):
+        durations = calculate_sample_durations(samples)
+        if all(_is_represented_in_held_out_recording(items, held_out, durations) for items in grouped.values()):
             return TrainingValidationSplit(
                 training=training,
                 validation=validation,
@@ -378,3 +378,20 @@ def split_vacuum_samples(
         method=ValidationMethod.HELD_OUT_EPISODES,
         signals=signals,
     )
+
+
+def _is_represented_in_held_out_recording(
+    episodes: Sequence[VacuumEpisode], held_out: int, durations: Mapping[int, float]
+) -> bool:
+    """Whether training has this activity and the held-out recording covers enough of it."""
+    held_out_episodes = [episode for episode in episodes if episode.samples[0].recording_id == held_out]
+    training_episodes = [episode for episode in episodes if episode.samples[0].recording_id != held_out]
+    if not held_out_episodes or not training_episodes:
+        return False
+    held_out_seconds = _calculate_episode_seconds(held_out_episodes, durations)
+    total_seconds = held_out_seconds + _calculate_episode_seconds(training_episodes, durations)
+    return held_out_seconds >= MIN_HELD_OUT_SHARE * total_seconds
+
+
+def _calculate_episode_seconds(episodes: Sequence[VacuumEpisode], durations: Mapping[int, float]) -> float:
+    return sum(durations.get(id(sample), 0.0) for episode in episodes for sample in episode.samples)

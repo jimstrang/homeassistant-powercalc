@@ -181,6 +181,8 @@ class ActivityReport:
     transition_mae_w: float | None
     mean_power_w: float
     energy: EnergyMetrics
+    #: Validated on energy rather than per-sample error, as a fixed power cannot follow a cycling load.
+    has_fixed_power: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {

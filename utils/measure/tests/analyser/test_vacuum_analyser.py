@@ -381,7 +381,7 @@ def test_short_mode_error_is_not_hidden_by_long_idle(tmp_path: Path) -> None:
     ]
     result = RecorderAnalyser().analyse(write_recording(tmp_path / "record.jsonl", data), CONTEXT)
     assert not result.model_ready
-    assert "washing validation error" in str(result.reason)
+    assert "washing validation predicts 22.00 W on average, but 100.00 W was measured" in str(result.reason)
     assert result.activity_reports
     assert result.validation_method is ValidationMethod.HELD_OUT_EPISODES
 
@@ -800,3 +800,79 @@ def test_average_power_weights_readings_by_the_time_they_represent() -> None:
     assert list(durations.values()) == [2.0, 4.0]
     assert calculate_average_power(data, durations) == 40.0
     assert calculate_average_power([before_last, next_recording], durations) == 1000.0
+
+
+def test_held_out_recording_must_cover_a_meaningful_share_of_each_activity() -> None:
+    # The first recording charges ten times longer, leaving the second only about 9% of charging.
+    long_charge = [item for item in cycle() for _ in range(10 if item.entities[STATE].state == "charging" else 1)]
+    first = [replace(item, elapsed_seconds=float(index)) for index, item in enumerate(long_charge)]
+    second = [replace(item, recording_id=1) for item in cycle()]
+
+    split = split_vacuum_samples(first + second, CONTEXT)
+
+    assert isinstance(split, TrainingValidationSplit)
+    assert split.method is ValidationMethod.HELD_OUT_EPISODES
+
+
+def test_fixed_power_activities_are_validated_on_energy() -> None:
+    reports = build_activity_reports(candidate(repeated()), repeated(), cycle())
+    assert {report.activity for report in reports if report.has_fixed_power} == {
+        "sleeping",
+        "washing",
+        "auto_emptying",
+        "drying",
+        "away",
+    }
+
+
+def activity_report(
+    mae_w: float,
+    measured_wh: float,
+    predicted_wh: float,
+    duration_seconds: float = 3600,
+    coverage: float = 1,
+    has_fixed_power: bool = True,
+) -> ActivityReport:
+    return ActivityReport(
+        activity="drying" if has_fixed_power else "charging",
+        sample_count=100,
+        episode_count=2,
+        validation_count=50,
+        coverage=coverage,
+        mae_w=mae_w,
+        transition_mae_w=None,
+        mean_power_w=measured_wh,
+        energy=EnergyMetrics(duration_seconds, measured_wh, predicted_wh, None),
+        has_fixed_power=has_fixed_power,
+    )
+
+
+@pytest.mark.parametrize(
+    "report,expected",
+    [
+        # A cycling heater: large per-sample error, but the fixed power holds its energy.
+        (activity_report(mae_w=50, measured_wh=66, predicted_wh=62), None),
+        (activity_report(mae_w=5, measured_wh=88, predicted_wh=62), "predicts 62.00 W on average, but 88.00 W"),
+        # Below the absolute allowance, a large relative error is still negligible.
+        (activity_report(mae_w=0.3, measured_wh=0.6, predicted_wh=1.0), None),
+        (activity_report(mae_w=0, measured_wh=0, predicted_wh=0, duration_seconds=0), "no consecutive readings"),
+        (activity_report(mae_w=0, measured_wh=66, predicted_wh=66, coverage=0.5), "cannot reliably identify drying"),
+        (
+            activity_report(mae_w=0, measured_wh=30, predicted_wh=30, coverage=0.25, has_fixed_power=False),
+            "charging model covers only 25% of its validation samples",
+        ),
+        # A charging curve should follow each reading, so it keeps the per-sample check.
+        (
+            activity_report(mae_w=10, measured_wh=30, predicted_wh=30, has_fixed_power=False),
+            "charging validation error",
+        ),
+        (activity_report(mae_w=1, measured_wh=30, predicted_wh=20, has_fixed_power=False), None),
+    ],
+)
+def test_activity_validation(report: ActivityReport, expected: str | None) -> None:
+    failure = find_credibility_failure([report])
+    if expected is None:
+        assert failure is None
+    else:
+        assert failure is not None
+        assert expected in failure
