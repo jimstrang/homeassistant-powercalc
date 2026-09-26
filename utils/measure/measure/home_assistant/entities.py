@@ -1,5 +1,4 @@
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from enum import StrEnum
 import math
 from typing import TYPE_CHECKING, Any
@@ -12,18 +11,15 @@ from measure.controller.light.effects import filter_recordable_effects
 from measure.home_assistant.client import HomeAssistantManager
 from measure.home_assistant.connectivity import Connectivity, detect_connectivity
 from measure.home_assistant.const import (
-    HASS_DEVICE_REGISTRY_CONFIG_ENTRIES,
-    HASS_DEVICE_REGISTRY_CONFIG_ENTRY_ID,
     HASS_DEVICE_REGISTRY_ID,
-    HASS_DEVICE_REGISTRY_IDENTIFIERS,
     HASS_DEVICE_REGISTRY_MANUFACTURER,
     HASS_DEVICE_REGISTRY_MODEL,
     HASS_DEVICE_REGISTRY_MODEL_ID,
-    HASS_DEVICE_REGISTRY_PARENT_DEVICE_ID,
     HASS_ENTITY_DEVICE_CLASS,
     HASS_ENTITY_GROUP_MEMBERS,
     HASS_ENTITY_UNIT_OF_MEASUREMENT,
 )
+from measure.home_assistant.device_relations import map_profile_related_devices
 
 if TYPE_CHECKING:
     from homeassistant_api import EntityRegistryEntry
@@ -232,67 +228,6 @@ class HomeAssistantEntityCatalog:
             [_enrich_group_device_metadata(descriptor, by_id) for descriptor in descriptors],
             map_profile_related_devices(data.device_registry),
         )
-
-
-def map_profile_related_devices(device_registry: Sequence[Mapping[str, object]]) -> dict[str, list[str]]:
-    """Map each device to the native children and Roborock docks PowerCalc searches for profile entities.
-
-    Mirrors get_profile_related_devices() in the PowerCalc integration, so a recorded entity
-    on such a device resolves through the same entity placeholders.
-    """
-
-    related: dict[str, list[str]] = defaultdict(list)
-    for device in device_registry:
-        device_id = _get_device_string(device, HASS_DEVICE_REGISTRY_ID)
-        parent_id = _get_device_string(device, HASS_DEVICE_REGISTRY_PARENT_DEVICE_ID)
-        if device_id is not None and parent_id is not None and parent_id != device_id:
-            related[parent_id].append(device_id)
-
-    for device in device_registry:
-        device_id = _get_device_string(device, HASS_DEVICE_REGISTRY_ID)
-        dock_identifiers = {
-            ("roborock", f"{identifier}_dock")
-            for domain, identifier in _get_identifiers(device)
-            if domain == "roborock"
-        }
-        if device_id is None or not dock_identifiers:
-            continue
-        config_entries = _get_config_entry_ids(device)
-        for candidate in device_registry:
-            candidate_id = _get_device_string(candidate, HASS_DEVICE_REGISTRY_ID)
-            if (
-                candidate_id is not None
-                and candidate_id != device_id
-                and candidate_id not in related[device_id]
-                and _get_identifiers(candidate) & dock_identifiers
-                and _get_config_entry_ids(candidate) & config_entries
-            ):
-                related[device_id].append(candidate_id)
-    return {device_id: device_ids for device_id, device_ids in related.items() if device_ids}
-
-
-def _get_device_string(device: Mapping[str, object], key: str) -> str | None:
-    value = device.get(key)
-    return value if isinstance(value, str) and value else None
-
-
-def _get_identifiers(device: Mapping[str, object]) -> set[tuple[str, str]]:
-    items = device.get(HASS_DEVICE_REGISTRY_IDENTIFIERS)
-    identifiers: set[tuple[str, str]] = set()
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, list | tuple) and len(item) == 2 and all(isinstance(part, str) for part in item):
-            identifiers.add((item[0], item[1]))
-    return identifiers
-
-
-def _get_config_entry_ids(device: Mapping[str, object]) -> set[str]:
-    """Home Assistant 2026.8+ reports one config_entry_id; older versions a config_entries list."""
-
-    entries = device.get(HASS_DEVICE_REGISTRY_CONFIG_ENTRIES)
-    entry_ids = {entry for entry in entries if isinstance(entry, str)} if isinstance(entries, list) else set()
-    if (entry_id := _get_device_string(device, HASS_DEVICE_REGISTRY_CONFIG_ENTRY_ID)) is not None:
-        entry_ids.add(entry_id)
-    return entry_ids
 
 
 def _describe_registry_entity(entry: EntityRegistryEntry, devices: dict[str, dict[str, object]]) -> EntityDescriptor:

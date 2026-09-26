@@ -17,6 +17,7 @@ from measure.analyser.models import (
     ValidationMethod,
 )
 from measure.analyser.recording import load_recordings, restore_recording_context
+from measure.analyser.sample_intervals import calculate_sample_durations
 from measure.analyser.service import RecorderAnalyser
 from measure.analyser.vacuum import (
     ChargingPoint,
@@ -24,7 +25,6 @@ from measure.analyser.vacuum import (
     VacuumCompositeCandidate,
     VacuumCompositeStrategy,
     calculate_average_power,
-    calculate_sample_durations,
     get_battery_level,
     group_vacuum_episodes,
     split_vacuum_samples,
@@ -783,7 +783,7 @@ def test_fixed_branch_preserves_energy_of_a_cycling_load() -> None:
 
     branches = {branch.activity: branch for branch in candidate(data).branches}
 
-    assert branches[Activity.DRYING].power == 87.0
+    assert branches[Activity.DRYING].power == 83.33
 
 
 def test_average_power_weights_readings_by_the_time_they_represent() -> None:
@@ -794,11 +794,11 @@ def test_average_power_weights_readings_by_the_time_they_represent() -> None:
     next_recording = replace(sample("drying", 1000, 0), recording_id=1)
     data = [held, short_reading, long_reading, before_last, next_recording]
 
-    durations = calculate_sample_durations(data)
+    durations = calculate_sample_durations(data, data)
 
-    # A reading holds until the next one, but not across a long gap or into another recording.
-    assert list(durations.values()) == [2.0, 4.0]
-    assert calculate_average_power(data, durations) == 40.0
+    # Each endpoint gets half the interval, excluding long gaps and recording boundaries.
+    assert list(durations.values()) == [1.0, 3.0, 2.0]
+    assert calculate_average_power(data, durations) == 35.0
     assert calculate_average_power([before_last, next_recording], durations) == 1000.0
 
 
@@ -815,7 +815,17 @@ def test_held_out_recording_must_cover_a_meaningful_share_of_each_activity() -> 
 
 
 def test_fixed_power_activities_are_validated_on_energy() -> None:
-    reports = build_activity_reports(candidate(repeated()), repeated(), cycle())
+    data = repeated()
+    split = split_vacuum_samples(data, CONTEXT)
+    assert isinstance(split, TrainingValidationSplit)
+    model = VacuumCompositeStrategy().build_candidate(split.training, CONTEXT, split.signals, recording_samples=data)
+    assert isinstance(model, VacuumCompositeCandidate)
+    reports = build_activity_reports(model, data, split.validation)
+    assert find_credibility_failure(reports) is None
+    for report in reports:
+        assert report.energy.duration_seconds > 0
+        assert report.energy.measured_wh > 0
+        assert report.energy.predicted_wh == pytest.approx(report.energy.measured_wh, abs=0.0001)
     assert {report.activity for report in reports if report.has_fixed_power} == {
         "sleeping",
         "washing",
@@ -876,3 +886,42 @@ def test_activity_validation(report: ActivityReport, expected: str | None) -> No
     else:
         assert failure is not None
         assert expected in failure
+
+
+@pytest.mark.parametrize("separate_recordings", [False, True])
+def test_identical_irregular_cycles_pass_energy_validation(tmp_path: Path, separate_recordings: bool) -> None:
+    first = [
+        sample("drying", power, time) for power, time in zip([0, 0, 0, 0, 100, 0], [0, 1, 2, 3, 4, 24], strict=True)
+    ]
+    first.extend(sample("sleeping", 3.5, time) for time in range(25, 35))
+    first.extend(sample("washing", 100, time) for time in range(35, 45))
+    if separate_recordings:
+        paths = [write_recording(tmp_path / "first.jsonl", first), write_recording(tmp_path / "second.jsonl", first)]
+    else:
+        second = [replace(item, elapsed_seconds=item.elapsed_seconds + 45) for item in first]
+        paths = [write_recording(tmp_path / "cycles.jsonl", first + second)]
+    result = RecorderAnalyser().analyse(paths, CONTEXT)
+    assert result.model_ready, result.reason
+    drying = next(report for report in result.activity_reports if report.activity == "drying")
+    assert drying.energy.duration_seconds == 24
+    assert drying.energy.measured_wh == pytest.approx(1050 / 3600, abs=0.0001)
+    assert drying.energy.predicted_wh == drying.energy.measured_wh
+
+
+def test_training_does_not_bridge_excluded_samples() -> None:
+    data = [sample("drying", 10, index) for index in range(5)]
+    data.extend(sample("sleeping", 3.5, index) for index in range(5, 10))
+    data.extend(sample("drying", 100, index) for index in range(10, 15))
+    data.extend(sample("sleeping", 3.5, index) for index in range(15, 20))
+    training = data[:5] + data[10:]
+    model = VacuumCompositeStrategy().build_candidate(
+        training, CONTEXT, discover_signals(data, CONTEXT), recording_samples=data
+    )
+    assert isinstance(model, VacuumCompositeCandidate)
+    drying = next(branch for branch in model.branches if branch.activity == Activity.DRYING)
+    assert drying.power == 55
+
+
+def test_time_weights_ignore_non_increasing_timestamps() -> None:
+    data = [sample("drying", 10, time) for time in [1, 1, 0]]
+    assert calculate_sample_durations(data, data) == {}

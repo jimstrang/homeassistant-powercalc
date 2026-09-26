@@ -17,6 +17,7 @@ from measure.analyser.models import (
     TrainingValidationSplit,
     ValidationMethod,
 )
+from measure.analyser.sample_intervals import calculate_sample_durations
 from measure.analyser.vacuum_signals import (
     Activity,
     ActivitySignal,
@@ -33,8 +34,6 @@ MIN_CHARGING_SPAN = 20
 CHARGING_BIN_WIDTH = 5
 MIN_CHARGING_BINS = 3
 MIN_SAMPLES_PER_CHARGING_BIN = 3
-#: Longer gaps between readings leave the power in between unknown.
-MAX_SAMPLE_INTERVAL_SECONDS = 30
 #: A held-out recording must cover this share of every activity's recorded time, so
 #: a few seconds of an activity cannot decide whether its model is credible.
 MIN_HELD_OUT_SHARE = 0.1
@@ -164,6 +163,8 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],
+        *,
+        recording_samples: Sequence[RecordingSample] | None = None,
     ) -> VacuumCompositeCandidate | StrategyNotApplicable:
         if context.recipe != "vacuum_robot":
             return StrategyNotApplicable("The vacuum analyser requires the vacuum recipe")
@@ -176,11 +177,12 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
         if any(sample.power < 0 for sample in samples):
             return StrategyNotApplicable("Vacuum power must be non-negative; check the meter or dummy-load correction")
         battery = find_battery_feature(grouped[Activity.CHARGING], context) if Activity.CHARGING in grouped else None
-        durations = calculate_sample_durations(samples)
+        original_samples = samples if recording_samples is None else recording_samples
         branches: list[VacuumBranch] = []
         for signal in signals:
             if not (activity_samples := grouped.get(signal.activity)):
                 continue
+            durations = calculate_sample_durations(original_samples, activity_samples)
             branch = _fit_branch(signal.activity, activity_samples, battery, durations)
             if isinstance(branch, StrategyNotApplicable):
                 return branch
@@ -201,19 +203,6 @@ def _fit_branch(
     # A fixed power must preserve energy: a median would pick the heater-on level of
     # a cycling dryer, or ignore the start-up ramp of a short bin emptying.
     return VacuumBranch(activity, round(calculate_average_power(samples, durations), 2))
-
-
-def calculate_sample_durations(samples: Sequence[RecordingSample]) -> dict[int, float]:
-    """Seconds each reading represents, keyed by id(sample): until the next reading of its recording.
-
-    Readings before a longer gap, or at the end of a recording, represent no time.
-    """
-    durations: dict[int, float] = {}
-    for current, following in pairwise(samples):
-        delta = following.elapsed_seconds - current.elapsed_seconds
-        if current.recording_id == following.recording_id and 0 < delta <= MAX_SAMPLE_INTERVAL_SECONDS:
-            durations[id(current)] = delta
-    return durations
 
 
 def calculate_average_power(samples: Sequence[RecordingSample], durations: Mapping[int, float]) -> float:
@@ -344,19 +333,41 @@ def split_vacuum_samples(
         activity: [episode for episode in items if len(episode.samples) >= MIN_EPISODE_SAMPLES]
         for activity, items in grouped.items()
     }
+    recording_split = _try_split_by_recording(samples, grouped, signals)
+    if recording_split is not None:
+        return recording_split
+    return _split_by_episode(samples, episodes, grouped, signals)
+
+
+def _try_split_by_recording(
+    samples: Sequence[RecordingSample],
+    grouped: Mapping[Activity, list[VacuumEpisode]],
+    signals: list[ActivitySignal],
+) -> TrainingValidationSplit | None:
     recordings = list(dict.fromkeys(sample.recording_id for sample in samples))
-    if len(recordings) > 1:
-        held_out = recordings[-1]
-        training = [sample for sample in samples if sample.recording_id != held_out]
-        validation = [sample for sample in samples if sample.recording_id == held_out]
-        durations = calculate_sample_durations(samples)
-        if all(_is_represented_in_held_out_recording(items, held_out, durations) for items in grouped.values()):
-            return TrainingValidationSplit(
-                training=training,
-                validation=validation,
-                method=ValidationMethod.HELD_OUT_RECORDING,
-                signals=signals,
-            )
+    if len(recordings) < 2:
+        return None
+    held_out = recordings[-1]
+    durations: dict[int, float] = {}
+    for episodes in grouped.values():
+        for episode in episodes:
+            durations.update(calculate_sample_durations(episode.samples, episode.samples))
+    if not all(_is_represented_in_held_out_recording(items, held_out, durations) for items in grouped.values()):
+        return None
+    return TrainingValidationSplit(
+        training=[sample for sample in samples if sample.recording_id != held_out],
+        validation=[sample for sample in samples if sample.recording_id == held_out],
+        method=ValidationMethod.HELD_OUT_RECORDING,
+        signals=signals,
+    )
+
+
+def _split_by_episode(
+    samples: Sequence[RecordingSample],
+    episodes: Sequence[VacuumEpisode],
+    grouped: Mapping[Activity, list[VacuumEpisode]],
+    signals: list[ActivitySignal],
+) -> TrainingValidationSplit:
     validation_ids = {
         id(sample)
         for items in grouped.values()

@@ -3,11 +3,11 @@ from unittest.mock import MagicMock
 
 from measure.controller.light.const import LutMode
 from measure.home_assistant.client import HomeAssistantEntityData, HomeAssistantManager
+from measure.home_assistant.device_relations import map_profile_related_devices
 from measure.home_assistant.entities import (
     DeviceClass,
     EntityDomain,
     HomeAssistantEntityCatalog,
-    map_profile_related_devices,
 )
 import pytest
 
@@ -439,8 +439,14 @@ def test_snapshot_requires_exactly_one_entity_filter() -> None:
 
 def test_related_devices_follow_powercalc_child_and_roborock_dock_rules() -> None:
     registry: list[dict[str, object]] = [
+        {"identifiers": [["roborock", "missing_id"]]},
         {"id": "robot", "identifiers": [["roborock", "duid"]], "config_entry_id": "entry"},
-        {"id": "dock", "identifiers": [["roborock", "duid_dock"]], "config_entry_id": "entry"},
+        {
+            "id": "dock",
+            "identifiers": [["roborock", "duid_dock"]],
+            "config_entry_id": "entry",
+            "parent_device_id": "robot",
+        },
         # Same identifier convention, but another config entry: not this vacuum's dock.
         {"id": "foreign_dock", "identifiers": [["roborock", "duid_dock"]], "config_entry_id": "other"},
         {"id": "legacy", "identifiers": [["roborock", "old"]], "config_entries": ["legacy_entry"]},
