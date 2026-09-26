@@ -2,12 +2,12 @@
 
 from dataclasses import replace
 
+from measure.analyser.entity_references import resolve_portable_entity
 from measure.analyser.vacuum_signals import (
     ALIASES,
     Activity,
     discover_signals,
     resolve_activity,
-    resolve_portable_entity,
 )
 from measure.recording.models import RecordedEntity, RecordedEntityState, RecordingContext, RecordingSample
 import pytest

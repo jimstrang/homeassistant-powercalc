@@ -3,7 +3,7 @@ import json
 import logging
 from pathlib import Path
 
-from measure.analyser.models import AnalysisStatus
+from measure.analyser.models import AnalysisStatus, RecorderAnalysisResult
 from measure.analyser.service import RecorderAnalyser
 from measure.profile.model_json import write_model_json
 from measure.recording.context import build_recording_context
@@ -56,27 +56,7 @@ class RecorderAnalysisExecution:
             context = build_recording_context(request)
             paths = find_recording_paths(output_directory, request.export_filename)
             analysis = self.analyser.analyse(paths, context)
-            write_json_atomic(output_directory / ANALYSER_FILENAME, analysis.to_dict())
-            (output_directory / _LEGACY_ANALYSIS_FILENAME).unlink(missing_ok=True)
-            if analysis.model_ready and analysis.model_config_fragment is not None:
-                write_model_json(
-                    output_directory,
-                    standby_power=analysis.standby_power,
-                    name=request.model_name,
-                    measure_device=request.measure_device,
-                    parameters=request.parameters,
-                    extra_json_data={
-                        "device_type": context.device_type,
-                        **analysis.model_config_fragment.to_dict(),
-                    },
-                    voltages=retained_voltages,
-                )
-            else:
-                model_path.unlink(missing_ok=True)
-                if analysis.reason:
-                    _LOGGER.warning("Profile was not created: %s", analysis.reason)
-            for warning in analysis.warnings:
-                _LOGGER.warning("Recording analysis: %s", warning)
+            _write_analysis_outputs(request, output_directory, analysis, context.device_type, retained_voltages)
             return _replace_analysis_summary(
                 summary,
                 {
@@ -85,9 +65,9 @@ class RecorderAnalysisExecution:
                     "Samples analysed": str(analysis.sample_count),
                 },
             )
-        except Exception as error:  # noqa: BLE001 - raw recording must survive optional analysis failures
+        except Exception as error:
             reason = f"Recording analysis failed: {error}"
-            _LOGGER.warning(reason)
+            _LOGGER.exception(reason)
             model_path.unlink(missing_ok=True)
             write_json_atomic(
                 output_directory / ANALYSER_FILENAME,
@@ -106,6 +86,33 @@ class RecorderAnalysisExecution:
                     "Recording analysis reason": reason,
                 },
             )
+
+
+def _write_analysis_outputs(
+    request: RecorderMeasurementRequest,
+    output_directory: Path,
+    analysis: RecorderAnalysisResult,
+    device_type: str,
+    voltages: list[float],
+) -> None:
+    write_json_atomic(output_directory / ANALYSER_FILENAME, analysis.to_dict())
+    (output_directory / _LEGACY_ANALYSIS_FILENAME).unlink(missing_ok=True)
+    if analysis.model_ready and analysis.model_config_fragment is not None:
+        write_model_json(
+            output_directory,
+            standby_power=analysis.standby_power,
+            name=request.model_name,
+            measure_device=request.measure_device,
+            parameters=request.parameters,
+            extra_json_data={"device_type": device_type, **analysis.model_config_fragment.to_dict()},
+            voltages=voltages,
+        )
+    else:
+        (output_directory / "model.json").unlink(missing_ok=True)
+        if analysis.reason:
+            _LOGGER.warning("Profile was not created: %s", analysis.reason)
+    for warning in analysis.warnings:
+        _LOGGER.warning("Recording analysis: %s", warning)
 
 
 def _replace_analysis_summary(

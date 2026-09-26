@@ -8,7 +8,9 @@ from itertools import pairwise
 import math
 from statistics import mean, median
 
+from measure.analyser.entity_references import resolve_portable_entity
 from measure.analyser.models import (
+    AnalysisCandidate,
     FeatureReference,
     FeatureSource,
     ModelConfigFragment,
@@ -24,7 +26,6 @@ from measure.analyser.vacuum_signals import (
     discover_signals,
     find_battery_feature,
     resolve_activity,
-    resolve_portable_entity,
 )
 from measure.recording.models import RecordingContext, RecordingSample
 
@@ -105,7 +106,10 @@ class VacuumCompositeCandidate:
         return resolve_activity(sample, self.signals)
 
     def estimate_power(self, sample: RecordingSample) -> float | None:
-        activity = self.get_support_key(sample)
+        return self.estimate_activity_power(sample, self.get_support_key(sample))
+
+    def estimate_activity_power(self, sample: RecordingSample, activity: Activity | None) -> float | None:
+        """Estimate a sample whose activity has already been resolved."""
         for branch in self.branches:
             # Composite checks an overridden source's availability before its
             # condition, including when it would otherwise skip charging.
@@ -158,14 +162,14 @@ class VacuumCompositeCandidate:
 class VacuumCompositeStrategy(ProfileAnalysisStrategy):
     strategy_id = "vacuum_composite"
 
-    def build_candidate(
+    def build_candidates(
         self,
         samples: Sequence[RecordingSample],
         context: RecordingContext,
         signals: Sequence[ActivitySignal],
         *,
         recording_samples: Sequence[RecordingSample] | None = None,
-    ) -> VacuumCompositeCandidate | StrategyNotApplicable:
+    ) -> list[AnalysisCandidate] | StrategyNotApplicable:
         if context.recipe != "vacuum_robot":
             return StrategyNotApplicable("The vacuum analyser requires the vacuum recipe")
         grouped: dict[Activity, list[RecordingSample]] = defaultdict(list)
@@ -187,7 +191,7 @@ class VacuumCompositeStrategy(ProfileAnalysisStrategy):
             if isinstance(branch, StrategyNotApplicable):
                 return branch
             branches.append(branch)
-        return VacuumCompositeCandidate(list(signals), branches, battery, context)
+        return [VacuumCompositeCandidate(list(signals), branches, battery, context)]
 
 
 def _fit_branch(

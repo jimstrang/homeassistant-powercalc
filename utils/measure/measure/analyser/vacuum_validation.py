@@ -1,10 +1,13 @@
 """Activity-level checks so long idle periods cannot hide a bad short dock mode."""
 
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from measure.analyser.models import UNEXPLAINED_ACTIVITY, ActivityReport, EnergyMetrics
 from measure.analyser.sample_intervals import calculate_sample_durations
-from measure.analyser.vacuum import VacuumCompositeCandidate, group_vacuum_episodes
+from measure.analyser.vacuum import VacuumCompositeCandidate, VacuumEpisode, group_vacuum_episodes
+from measure.analyser.vacuum_signals import Activity
 from measure.recording.models import RecordingSample
 
 MAX_RELATIVE_ACTIVITY_ERROR = 0.2
@@ -14,46 +17,63 @@ MIN_ACTIVITY_ERROR_ALLOWANCE_W = 0.5
 MAX_UNEXPLAINED_SHARE = 0.1
 
 
+@dataclass
+class _ActivityValidation:
+    episodes: list[VacuumEpisode] = field(default_factory=list)
+    samples: list[RecordingSample] = field(default_factory=list)
+    predictions: dict[int, float] = field(default_factory=dict)
+
+    def build_report(
+        self, activity: Activity | None, recording: Sequence[RecordingSample], *, has_fixed_power: bool
+    ) -> ActivityReport:
+        transition_ids = {
+            id(sample) for episode in self.episodes for sample in (episode.samples[0], episode.samples[-1])
+        }
+        errors: list[float] = []
+        transition_errors: list[float] = []
+        for sample in self.samples:
+            power = self.predictions.get(id(sample))
+            if power is None:
+                continue
+            error = abs(power - sample.power)
+            errors.append(error)
+            if id(sample) in transition_ids:
+                transition_errors.append(error)
+        return ActivityReport(
+            activity=activity.value if activity is not None else UNEXPLAINED_ACTIVITY,
+            sample_count=sum(len(episode.samples) for episode in self.episodes),
+            episode_count=len(self.episodes),
+            validation_count=len(self.samples),
+            coverage=len(errors) / len(self.samples) if self.samples else 0,
+            mae_w=sum(errors) / len(errors) if errors else None,
+            transition_mae_w=sum(transition_errors) / len(transition_errors) if transition_errors else None,
+            mean_power_w=sum(sample.power for sample in self.samples) / len(self.samples) if self.samples else 0,
+            energy=_calculate_energy_metrics(recording, self.samples, self.predictions),
+            has_fixed_power=has_fixed_power,
+        )
+
+
 def build_activity_reports(
     candidate: VacuumCompositeCandidate,
     samples: Sequence[RecordingSample],
     validation: Sequence[RecordingSample],
 ) -> list[ActivityReport]:
-    episodes = group_vacuum_episodes(samples, candidate.signals)
-    activities = list(dict.fromkeys(episode.activity for episode in episodes))
-    transition_ids = {id(sample) for episode in episodes for sample in (episode.samples[0], episode.samples[-1])}
+    """Group activities once and reuse each prediction for sample and energy errors."""
+    grouped: dict[Activity | None, _ActivityValidation] = defaultdict(_ActivityValidation)
+    for episode in group_vacuum_episodes(samples, candidate.signals):
+        grouped[episode.activity].episodes.append(episode)
+    for sample in validation:
+        activity = candidate.get_support_key(sample)
+        data = grouped[activity]
+        data.samples.append(sample)
+        power = candidate.estimate_activity_power(sample, activity)
+        if power is not None:
+            data.predictions[id(sample)] = power
     fixed_activities = {branch.activity for branch in candidate.branches if branch.power is not None}
-    reports: list[ActivityReport] = []
-    for activity in activities:
-        all_samples = [sample for sample in samples if candidate.get_support_key(sample) == activity]
-        held_out = [sample for sample in validation if candidate.get_support_key(sample) == activity]
-        errors = _calculate_prediction_errors(candidate, held_out)
-        transition_errors = _calculate_prediction_errors(
-            candidate, [sample for sample in held_out if id(sample) in transition_ids]
-        )
-        reports.append(
-            ActivityReport(
-                activity=activity.value if activity is not None else UNEXPLAINED_ACTIVITY,
-                sample_count=len(all_samples),
-                episode_count=sum(episode.activity == activity for episode in episodes),
-                validation_count=len(held_out),
-                coverage=round(len(errors) / len(held_out), 4) if held_out else 0,
-                mae_w=round(sum(errors) / len(errors), 3) if errors else None,
-                transition_mae_w=round(sum(transition_errors) / len(transition_errors), 3)
-                if transition_errors
-                else None,
-                mean_power_w=sum(sample.power for sample in held_out) / len(held_out) if held_out else 0,
-                energy=_calculate_energy_metrics(candidate, samples, held_out),
-                has_fixed_power=activity in fixed_activities,
-            )
-        )
-    return reports
-
-
-def _calculate_prediction_errors(
-    candidate: VacuumCompositeCandidate, samples: Sequence[RecordingSample]
-) -> list[float]:
-    return [abs(power - sample.power) for sample in samples if (power := candidate.estimate_power(sample)) is not None]
+    return [
+        data.build_report(activity, samples, has_fixed_power=activity in fixed_activities)
+        for activity, data in grouped.items()
+    ]
 
 
 def find_credibility_failure(reports: Sequence[ActivityReport]) -> str | None:
@@ -114,24 +134,22 @@ def _find_energy_failure(report: ActivityReport) -> str | None:
 
 
 def _calculate_energy_metrics(
-    candidate: VacuumCompositeCandidate,
     samples: Sequence[RecordingSample],
     held_out: Sequence[RecordingSample],
+    predictions: Mapping[int, float],
 ) -> EnergyMetrics:
-    predictions = {id(sample): candidate.estimate_power(sample) for sample in held_out}
-    covered = [sample for sample in held_out if predictions[id(sample)] is not None]
+    covered = [sample for sample in held_out if id(sample) in predictions]
     durations = calculate_sample_durations(samples, covered)
     measured = predicted = duration = 0.0
     for sample in covered:
         weight = durations.get(id(sample), 0.0)
         power = predictions[id(sample)]
-        assert power is not None
         duration += weight
         measured += sample.power * weight / 3600
         predicted += power * weight / 3600
     return EnergyMetrics(
-        duration_seconds=round(duration, 3),
-        measured_wh=round(measured, 4),
-        predicted_wh=round(predicted, 4),
-        bias_percent=round(100 * (predicted - measured) / measured, 2) if measured else None,
+        duration_seconds=duration,
+        measured_wh=measured,
+        predicted_wh=predicted,
+        bias_percent=100 * (predicted - measured) / measured if measured else None,
     )

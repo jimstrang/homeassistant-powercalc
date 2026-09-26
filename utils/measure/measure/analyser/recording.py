@@ -14,11 +14,12 @@ from measure.recording.models import (
 )
 
 
-def load_recording(path: Path) -> LoadedRecording:
+def load_recording(path: Path, *, recording_id: int = 0) -> LoadedRecording:
     """Load typed recorder JSONL while accepting recordings from before format v1."""
 
     samples: list[RecordingSample] = []
-    invalid_records: list[str] = []
+    invalid_count = 0
+    first_invalid: str | None = None
     metadata: dict[str, object] | None = None
     with path.open(encoding="utf-8") as recording:
         for line_number, line in enumerate(recording, start=1):
@@ -31,44 +32,42 @@ def load_recording(path: Path) -> LoadedRecording:
                     continue
                 if record.get("record_type") not in (None, "sample"):
                     continue
-                sample = _parse_sample(record)
+                sample = _parse_sample(record, recording_id)
             except (KeyError, ValueError, TypeError) as error:
-                invalid_records.append(f"line {line_number}: {error}")
+                invalid_count += 1
+                if first_invalid is None:
+                    first_invalid = f"line {line_number}: {error}"
                 continue
             samples.append(sample)
     warnings: list[str] = []
-    if invalid_records:
-        warnings.append(f"Skipped {len(invalid_records)} invalid recorder line(s); first was {invalid_records[0]}")
+    if invalid_count:
+        warnings.append(f"Skipped {invalid_count} invalid recorder line(s); first was {first_invalid}")
     return LoadedRecording(RecordingDataset(samples, metadata), warnings)
 
 
 def load_recordings(paths: Sequence[Path]) -> LoadedRecording:
     if not paths:
         raise ValueError("Select at least one recording")
-    loaded = [load_recording(path) for path in paths]
-    metadata = loaded[0].dataset.metadata
-    for recording in loaded[1:]:
+    first = load_recording(paths[0])
+    metadata = first.dataset.metadata
+    selected_entities = _normalize_selected_entity_metadata(metadata) if metadata is not None else []
+    samples = first.dataset.samples
+    warnings = first.warnings
+    for index, path in enumerate(paths[1:], start=1):
+        recording = load_recording(path, recording_id=index)
         other = recording.dataset.metadata
         if (
             metadata is not None
             and other is not None
             and (
                 any(metadata.get(key) != other.get(key) for key in ("recipe", "primary_entity_id"))
-                or _normalize_selected_entity_metadata(metadata) != _normalize_selected_entity_metadata(other)
+                or selected_entities != _normalize_selected_entity_metadata(other)
             )
         ):
             raise ValueError("Combined recordings must describe the same recipe and entities")
-    return LoadedRecording(
-        RecordingDataset(
-            [
-                replace(sample, recording_id=index)
-                for index, recording in enumerate(loaded)
-                for sample in recording.dataset.samples
-            ],
-            metadata,
-        ),
-        [warning for recording in loaded for warning in recording.warnings],
-    )
+        samples.extend(recording.dataset.samples)
+        warnings.extend(recording.warnings)
+    return LoadedRecording(RecordingDataset(samples, metadata), warnings)
 
 
 def _normalize_selected_entity_metadata(metadata: Mapping[str, object]) -> list[RecordedEntity]:
@@ -142,7 +141,7 @@ def _parse_metadata_entities(value: object) -> list[RecordedEntity]:
     return result
 
 
-def _parse_sample(record: dict[str, object]) -> RecordingSample:
+def _parse_sample(record: dict[str, object], recording_id: int) -> RecordingSample:
     elapsed_seconds = _parse_number(record["elapsed_seconds"])
     power = _parse_number(record["power"])
     if not math.isfinite(elapsed_seconds) or not math.isfinite(power):
@@ -159,7 +158,7 @@ def _parse_sample(record: dict[str, object]) -> RecordingSample:
         if not isinstance(state, str) or not isinstance(attributes, dict):
             raise ValueError("entity state must be a string and attributes an object")
         entities[entity_id] = RecordedEntityState(state, attributes)
-    return RecordingSample(elapsed_seconds, power, entities)
+    return RecordingSample(elapsed_seconds, power, entities, recording_id=recording_id)
 
 
 def _parse_number(value: object) -> float:

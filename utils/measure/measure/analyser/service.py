@@ -9,6 +9,7 @@ from measure.analyser.fixed import FixedStatesPowerStrategy
 from measure.analyser.models import (
     ActivityReport,
     AnalysisCandidate,
+    AnalysisFailure,
     AnalysisMetrics,
     AnalysisStatus,
     EvaluatedCandidate,
@@ -54,32 +55,18 @@ class RecorderAnalyser:
         if isinstance(split, StrategyNotApplicable):
             return _build_insufficient_data_result(samples, loaded.warnings, split.reason)
         baseline = _calculate_baseline_metrics(split.training, split.validation)
-        evaluated: list[EvaluatedCandidate] = []
-        # Each reason carries the reports of the candidate that produced it, so the result
-        # never explains one strategy's rejection with another strategy's activities.
-        failures: list[tuple[str, list[ActivityReport]]] = []
+        outcomes: list[EvaluatedCandidate | AnalysisFailure] = []
         for strategy in self._select_strategies(context):
-            candidate = strategy.build_candidate(split.training, context, split.signals, recording_samples=samples)
-            if isinstance(candidate, StrategyNotApplicable):
-                failures.append((candidate.reason, []))
-                _LOGGER.debug("Analyser strategy %s was not applicable: %s", strategy.strategy_id, candidate.reason)
-                continue
-            metrics = _evaluate(candidate, samples, split.validation)
-            _LOGGER.debug("Analyser strategy %s produced %s", strategy.strategy_id, metrics.to_dict())
-            reports = (
-                build_activity_reports(candidate, samples, split.validation)
-                if isinstance(candidate, VacuumCompositeCandidate)
-                else []
-            )
-            evaluation = EvaluatedCandidate(candidate, metrics, reports)
-            if (failure := _find_candidate_failure(evaluation, samples, baseline)) is None:
-                evaluated.append(evaluation)
-            else:
-                failures.append((failure, reports))
-
+            outcomes.extend(_evaluate_strategy(strategy, samples, split, context, baseline))
+        evaluated = [outcome for outcome in outcomes if isinstance(outcome, EvaluatedCandidate)]
         if not evaluated:
-            reason, reports = failures[0] if failures else ("No analysis strategy could explain the recorded power", [])
-            return _build_insufficient_data_result(samples, loaded.warnings, reason, split.method, reports)
+            failures = [outcome for outcome in outcomes if isinstance(outcome, AnalysisFailure)]
+            failure = (
+                failures[0] if failures else AnalysisFailure("No analysis strategy could explain the recorded power")
+            )
+            return _build_insufficient_data_result(
+                samples, loaded.warnings, failure.reason, split.method, failure.activity_reports
+            )
 
         evaluation = _select_candidate(evaluated)
         selected = evaluation.candidate
@@ -106,6 +93,32 @@ class RecorderAnalyser:
         return [strategy for strategy in self.strategies if (strategy.strategy_id == "vacuum_composite") == is_vacuum]
 
 
+def _evaluate_strategy(
+    strategy: ProfileAnalysisStrategy,
+    samples: Sequence[RecordingSample],
+    split: TrainingValidationSplit,
+    context: RecordingContext,
+    baseline: AnalysisMetrics,
+) -> list[EvaluatedCandidate | AnalysisFailure]:
+    candidates = strategy.build_candidates(split.training, context, split.signals, recording_samples=samples)
+    if isinstance(candidates, StrategyNotApplicable):
+        _LOGGER.debug("Analyser strategy %s was not applicable: %s", strategy.strategy_id, candidates.reason)
+        return [AnalysisFailure(candidates.reason)]
+    outcomes: list[EvaluatedCandidate | AnalysisFailure] = []
+    for candidate in candidates:
+        metrics = _evaluate(candidate, samples, split.validation)
+        _LOGGER.debug("Analyser feature %s produced %s", candidate.feature.identifier, metrics.to_dict())
+        reports = (
+            build_activity_reports(candidate, samples, split.validation)
+            if isinstance(candidate, VacuumCompositeCandidate)
+            else []
+        )
+        evaluation = EvaluatedCandidate(candidate, metrics, reports)
+        failure = _find_candidate_failure(evaluation, samples, baseline)
+        outcomes.append(AnalysisFailure(failure, reports) if failure is not None else evaluation)
+    return outcomes
+
+
 def _split_analysis_samples(
     samples: Sequence[RecordingSample], context: RecordingContext
 ) -> TrainingValidationSplit | StrategyNotApplicable:
@@ -123,8 +136,8 @@ def _find_candidate_failure(
 ) -> str | None:
     candidate = evaluation.candidate
     metrics = evaluation.metrics
-    if (failure := find_credibility_failure(evaluation.activity_reports)) is not None:
-        return failure
+    if isinstance(candidate, VacuumCompositeCandidate):
+        return find_credibility_failure(evaluation.activity_reports)
     if not _has_minimum_support(candidate, samples):
         return f"{candidate.strategy_id} needs at least {MIN_SAMPLES_PER_MODEL_VALUE} samples for every value"
     prediction_range = _calculate_prediction_range(candidate, samples)
@@ -145,7 +158,7 @@ def _calculate_baseline_metrics(
 ) -> AnalysisMetrics:
     estimate = median(sample.power for sample in training)
     errors = [estimate - sample.power for sample in validation]
-    return _calculate_metrics(len(training) + len(validation), validation, errors, len(validation))
+    return _calculate_metrics(len(training) + len(validation), validation, errors)
 
 
 def _evaluate(
@@ -156,16 +169,15 @@ def _evaluate(
     errors = [
         estimate - sample.power for sample in validation if (estimate := candidate.estimate_power(sample)) is not None
     ]
-    return _calculate_metrics(len(samples), validation, errors, len(errors))
+    return _calculate_metrics(len(samples), validation, errors)
 
 
 def _calculate_metrics(
     sample_count: int,
     validation: Sequence[RecordingSample],
     errors: Sequence[float],
-    covered: int,
 ) -> AnalysisMetrics:
-    coverage = covered / len(validation) if validation else 0
+    coverage = len(errors) / len(validation) if validation else 0
     mae = sum(abs(error) for error in errors) / len(errors) if errors else math.inf
     rmse = math.sqrt(sum(error**2 for error in errors) / len(errors)) if errors else math.inf
     powers = [sample.power for sample in validation]
