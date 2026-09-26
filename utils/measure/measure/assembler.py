@@ -207,13 +207,10 @@ class MeasurementAssembler:
             return SpeakerRunner(sampler, parameters, media_controller, interaction)
         if isinstance(request, RecorderMeasurementRequest):
             state_reader = self._create_recorder_state_reader() if request.recorded_entity_ids else None
-            context = (
-                build_recording_context(
-                    request, HomeAssistantEntityCatalog(self._require_home_assistant()).load_snapshot().get_all()
-                )
-                if request.recorded_entity_ids
-                else None
-            )
+            context = None
+            if request.recorded_entity_ids:
+                snapshot = HomeAssistantEntityCatalog(self._require_home_assistant()).load_snapshot()
+                context = build_recording_context(request, snapshot.get_all(), snapshot.related_device_ids)
             return RecorderRunner(sampler, interaction, state_reader, context)
         if isinstance(request, AverageMeasurementRequest):
             return AverageRunner(sampler, interaction=interaction)

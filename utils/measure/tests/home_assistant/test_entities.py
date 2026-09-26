@@ -3,7 +3,12 @@ from unittest.mock import MagicMock
 
 from measure.controller.light.const import LutMode
 from measure.home_assistant.client import HomeAssistantEntityData, HomeAssistantManager
-from measure.home_assistant.entities import DeviceClass, EntityDomain, HomeAssistantEntityCatalog
+from measure.home_assistant.entities import (
+    DeviceClass,
+    EntityDomain,
+    HomeAssistantEntityCatalog,
+    map_profile_related_devices,
+)
 import pytest
 
 
@@ -430,3 +435,39 @@ def test_snapshot_requires_exactly_one_entity_filter() -> None:
 
     with pytest.raises(ValueError, match="Specify exactly one entity filter"):
         snapshot.select(domain=EntityDomain.LIGHT, device_class=DeviceClass.POWER)
+
+
+def test_related_devices_follow_powercalc_child_and_roborock_dock_rules() -> None:
+    registry: list[dict[str, object]] = [
+        {"id": "robot", "identifiers": [["roborock", "duid"]], "config_entry_id": "entry"},
+        {"id": "dock", "identifiers": [["roborock", "duid_dock"]], "config_entry_id": "entry"},
+        # Same identifier convention, but another config entry: not this vacuum's dock.
+        {"id": "foreign_dock", "identifiers": [["roborock", "duid_dock"]], "config_entry_id": "other"},
+        {"id": "legacy", "identifiers": [["roborock", "old"]], "config_entries": ["legacy_entry"]},
+        {"id": "legacy_dock", "identifiers": [["roborock", "old_dock"]], "config_entries": ["legacy_entry"]},
+        # Only Roborock uses the _dock identifier convention.
+        {"id": "dreame", "identifiers": [["dreame_vacuum", "x"]], "config_entry_id": "dreame_entry"},
+        {"id": "dreame_dock", "identifiers": [["dreame_vacuum", "x_dock"]], "config_entry_id": "dreame_entry"},
+        {"id": "ups", "identifiers": "malformed", "config_entries": "malformed"},
+        {"id": "battery", "identifiers": [["nut", "b"], ["bad"]], "parent_device_id": "ups"},
+        {"id": "self", "parent_device_id": "self"},
+        # A bridge linked through via_device_id is not a related device.
+        {"id": "bulb", "via_device_id": "ups"},
+    ]
+
+    assert map_profile_related_devices(registry) == {
+        "robot": ["dock"],
+        "legacy": ["legacy_dock"],
+        "ups": ["battery"],
+    }
+
+
+def test_catalog_snapshot_exposes_related_devices() -> None:
+    data = _entity_data()
+    data.device_registry.append({"id": "child", "parent_device_id": "meter-device"})
+    home_assistant = MagicMock(spec=HomeAssistantManager)
+    home_assistant.get_entity_data.return_value = data
+
+    snapshot = HomeAssistantEntityCatalog(home_assistant).load_snapshot()
+
+    assert snapshot.related_device_ids == {"meter-device": ["child"]}

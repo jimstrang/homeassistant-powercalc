@@ -601,8 +601,10 @@ def test_metadata_validation_and_legacy_loading(tmp_path: Path) -> None:
                 },
             ],
             "device_entities": {},
+            "related_device_ids": ["dock", 5],
         },
     )
+    assert enriched.related_device_ids == ["dock"]
     assert enriched.entities[0].role == "primary"
     assert enriched.entities[0].device_id == "new"
     assert enriched.entities[0].unit is None
